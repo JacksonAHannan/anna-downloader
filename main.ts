@@ -21,6 +21,7 @@ export interface Book {
   authors: string;
   url: string;
   hash: string;
+  downloadCount: number;
 }
 
 interface FastDownloadResponse {
@@ -118,6 +119,14 @@ export async function findBook(query: string): Promise<Book[]> {
       // Publisher link
       const publisher = $container.find('a[href*="/search?q="]').eq(1).text().trim();
 
+      // Extract download count - look for text like "123 downloads"
+      // Download count is typically in a div with download statistics
+      let downloadCount = 0;
+      const downloadText = $container.text().match(/(\d+(?:,\d+)?)\s*downloads?/i);
+      if (downloadText) {
+        downloadCount = parseInt(downloadText[1].replace(/,/g, ''), 10);
+      }
+
       const { language, format, size } = extractMetaInformation(meta);
 
       const link = $el.attr('href') || '';
@@ -132,6 +141,7 @@ export async function findBook(query: string): Promise<Book[]> {
         authors: authors.trim(),
         url: new URL(link, fullURL).href,
         hash: hash,
+        downloadCount: downloadCount,
       };
 
       bookList.push(book);
@@ -306,7 +316,7 @@ export function loadConfig(): Config {
 export function filterBooks(books: Book[], config: Config): Book | null {
   if (books.length === 0) return null;
 
-  let filtered = books;
+  let filtered = [...books]; // Create a copy to avoid mutating the original array
 
   // Filter by language if specified
   if (config.preferredLanguage) {
@@ -324,7 +334,9 @@ export function filterBooks(books: Book[], config: Config): Book | null {
     if (byFormat.length > 0) filtered = byFormat;
   }
 
-  // Return first match
+  // Sort by download count (highest first) and return most downloaded
+  filtered.sort((a, b) => b.downloadCount - a.downloadCount);
+
   return filtered[0] || null;
 }
 

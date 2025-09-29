@@ -42,11 +42,55 @@ describe('findBook', () => {
       title: 'The Demon Haunted World',
       authors: 'Carl Sagan',
       publisher: 'Ballantine Books',
-      language: 'English',
-      format: 'pdf',
+      language: 'English [en]',
+      format: 'PDF',
       size: '10 MB',
       hash: 'abc123def456',
+      downloadCount: 5234,
     });
+  });
+
+  it('should extract download counts from search results', async () => {
+    const htmlFixture = fs.readFileSync(
+      path.join(__dirname, '__fixtures__', 'search-results.html'),
+      'utf-8'
+    );
+
+    mockAxios
+      .onGet(/annas-archive\.org\/search/)
+      .reply(200, htmlFixture);
+
+    const books = await findBook('Carl Sagan Demon Haunted World');
+
+    expect(books).toHaveLength(3);
+    expect(books[0].downloadCount).toBe(5234);
+    expect(books[1].downloadCount).toBe(2891);
+    expect(books[2].downloadCount).toBe(1042);
+  });
+
+  it('should handle missing download counts', async () => {
+    const htmlWithoutDownloads = `
+      <!DOCTYPE html>
+      <html>
+      <body>
+        <div>
+          <a href="/md5/test123" class="truncate text-xl font-bold">Test Book</a>
+          <div><a href="/search?q=Test%20Author">Test Author</a></div>
+          <div><a href="/search?q=Test%20Pub">Test Pub</a></div>
+          <div class="text-gray-800">English [en] · PDF · 5 MB</div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    mockAxios
+      .onGet(/annas-archive\.org\/search/)
+      .reply(200, htmlWithoutDownloads);
+
+    const books = await findBook('Test Book');
+
+    expect(books).toHaveLength(1);
+    expect(books[0].downloadCount).toBe(0);
   });
 
   it('should handle empty search results', async () => {
@@ -114,6 +158,7 @@ describe('filterBooks', () => {
       size: '5 MB',
       url: 'http://example.com/1',
       hash: 'hash1',
+      downloadCount: 1000,
     },
     {
       title: 'Book 2',
@@ -124,6 +169,7 @@ describe('filterBooks', () => {
       size: '3 MB',
       url: 'http://example.com/2',
       hash: 'hash2',
+      downloadCount: 5000,
     },
     {
       title: 'Book 3',
@@ -134,17 +180,31 @@ describe('filterBooks', () => {
       size: '4 MB',
       url: 'http://example.com/3',
       hash: 'hash3',
+      downloadCount: 3000,
     },
   ];
 
-  it('should return first book when no preferences set', () => {
+  it('should return most downloaded book when no preferences set', () => {
     const config = {
       secretKey: 'test',
       outputFolder: './downloads',
     };
 
     const result = filterBooks(mockBooks, config);
-    expect(result).toBe(mockBooks[0]);
+    // Should return Book 2 (Spanish, 5000 downloads) as it has the highest download count
+    expect(result).toBe(mockBooks[1]);
+    expect(result?.downloadCount).toBe(5000);
+  });
+
+  it('should sort by download count and return most downloaded', () => {
+    const config = {
+      secretKey: 'test',
+      outputFolder: './downloads',
+    };
+
+    const result = filterBooks(mockBooks, config);
+    expect(result?.title).toBe('Book 2');
+    expect(result?.downloadCount).toBe(5000);
   });
 
   it('should filter by language preference', () => {
@@ -156,6 +216,56 @@ describe('filterBooks', () => {
 
     const result = filterBooks(mockBooks, config);
     expect(result?.language).toBe('Spanish');
+    expect(result?.downloadCount).toBe(5000);
+  });
+
+  it('should filter by language then sort by download count', () => {
+    const booksWithMultipleEnglish: Book[] = [
+      {
+        title: 'English Book 1',
+        authors: 'Author A',
+        publisher: 'Pub A',
+        language: 'English',
+        format: 'pdf',
+        size: '5 MB',
+        url: 'http://example.com/a',
+        hash: 'hashA',
+        downloadCount: 2000,
+      },
+      {
+        title: 'Spanish Book',
+        authors: 'Author B',
+        publisher: 'Pub B',
+        language: 'Spanish',
+        format: 'epub',
+        size: '3 MB',
+        url: 'http://example.com/b',
+        hash: 'hashB',
+        downloadCount: 10000,
+      },
+      {
+        title: 'English Book 2',
+        authors: 'Author C',
+        publisher: 'Pub C',
+        language: 'English',
+        format: 'mobi',
+        size: '4 MB',
+        url: 'http://example.com/c',
+        hash: 'hashC',
+        downloadCount: 8000,
+      },
+    ];
+
+    const config = {
+      secretKey: 'test',
+      outputFolder: './downloads',
+      preferredLanguage: 'English',
+    };
+
+    const result = filterBooks(booksWithMultipleEnglish, config);
+    // Should return English Book 2 (8000 downloads) not English Book 1 (2000 downloads)
+    expect(result?.title).toBe('English Book 2');
+    expect(result?.downloadCount).toBe(8000);
   });
 
   it('should filter by format preference', () => {
@@ -180,6 +290,58 @@ describe('filterBooks', () => {
     const result = filterBooks(mockBooks, config);
     expect(result?.language).toBe('English');
     expect(result?.format).toBe('mobi');
+    expect(result?.downloadCount).toBe(3000);
+  });
+
+  it('should filter by format then sort by download count', () => {
+    const booksWithMultiplePDF: Book[] = [
+      {
+        title: 'PDF Book 1',
+        authors: 'Author A',
+        publisher: 'Pub A',
+        language: 'English',
+        format: 'pdf',
+        size: '5 MB',
+        url: 'http://example.com/a',
+        hash: 'hashA',
+        downloadCount: 1500,
+      },
+      {
+        title: 'PDF Book 2',
+        authors: 'Author B',
+        publisher: 'Pub B',
+        language: 'English',
+        format: 'pdf',
+        size: '3 MB',
+        url: 'http://example.com/b',
+        hash: 'hashB',
+        downloadCount: 7500,
+      },
+      {
+        title: 'EPUB Book',
+        authors: 'Author C',
+        publisher: 'Pub C',
+        language: 'English',
+        format: 'epub',
+        size: '4 MB',
+        url: 'http://example.com/c',
+        hash: 'hashC',
+        downloadCount: 9000,
+      },
+    ];
+
+    const config = {
+      secretKey: 'test',
+      outputFolder: './downloads',
+      preferredFormat: 'pdf',
+    };
+
+    const result = filterBooks(booksWithMultiplePDF, config);
+    // Should return PDF Book 2 (7500 downloads) not PDF Book 1 (1500 downloads)
+    // Even though EPUB has more downloads, format filter should apply first
+    expect(result?.title).toBe('PDF Book 2');
+    expect(result?.format).toBe('pdf');
+    expect(result?.downloadCount).toBe(7500);
   });
 
   it('should return null for empty book list', () => {
@@ -192,7 +354,7 @@ describe('filterBooks', () => {
     expect(result).toBeNull();
   });
 
-  it('should fallback to unfiltered list if no matches found', () => {
+  it('should fallback to unfiltered list sorted by downloads if no matches found', () => {
     const config = {
       secretKey: 'test',
       outputFolder: './downloads',
@@ -200,7 +362,9 @@ describe('filterBooks', () => {
     };
 
     const result = filterBooks(mockBooks, config);
-    expect(result).toBe(mockBooks[0]);
+    // Should fallback to all books and return most downloaded (Book 2 with 5000 downloads)
+    expect(result).toBe(mockBooks[1]);
+    expect(result?.downloadCount).toBe(5000);
   });
 });
 
@@ -336,6 +500,7 @@ describe('bookToString', () => {
       size: '5 MB',
       url: 'http://example.com/book',
       hash: 'testhash123',
+      downloadCount: 1234,
     };
 
     const result = bookToString(book);
@@ -362,6 +527,7 @@ describe('bookToJSON', () => {
       size: '5 MB',
       url: 'http://example.com/book',
       hash: 'testhash123',
+      downloadCount: 1234,
     };
 
     const result = bookToJSON(book);
@@ -386,6 +552,7 @@ describe('downloadBook', () => {
       size: '5 MB',
       url: 'http://example.com/book',
       hash: 'testhash123',
+      downloadCount: 1234,
     };
 
     // Mock the fast download API response
@@ -428,6 +595,7 @@ describe('downloadBook', () => {
       size: '5 MB',
       url: 'http://example.com/book',
       hash: 'testhash123',
+      downloadCount: 1234,
     };
 
     mockAxios
@@ -449,6 +617,7 @@ describe('downloadBook', () => {
       size: '5 MB',
       url: 'http://example.com/book',
       hash: 'testhash123',
+      downloadCount: 1234,
     };
 
     mockAxios
