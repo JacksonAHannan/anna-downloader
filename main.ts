@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { pipeline } from 'stream/promises';
 import { parse } from 'csv-parse/sync';
+import { stringify } from 'csv-stringify/sync';
 
 // Constants
 const ANNAS_SEARCH_ENDPOINT = 'https://annas-archive.org/search?q=';
@@ -30,6 +31,7 @@ interface FastDownloadResponse {
 interface CSVRow {
   author: string;
   title: string;
+  status?: string;
 }
 
 interface Config {
@@ -37,6 +39,7 @@ interface Config {
   outputFolder: string;
   preferredFormat?: string;
   preferredLanguage?: string;
+  maxDownloads?: number;
 }
 
 /**
@@ -47,15 +50,16 @@ export function extractMetaInformation(meta: string): {
   format: string;
   size: string;
 } {
-  const parts = meta.split(', ');
-  if (parts.length < 5) {
+  // New format: "English [en] · EPUB · 0.4MB"
+  const parts = meta.split(' · ');
+  if (parts.length < 3) {
     return { language: '', format: '', size: '' };
   }
 
   return {
     language: parts[0],
     format: parts[1],
-    size: parts[3],
+    size: parts[2],
   };
 }
 
@@ -65,8 +69,6 @@ export function extractMetaInformation(meta: string): {
 export async function findBook(query: string): Promise<Book[]> {
   const encodedQuery = encodeURIComponent(query);
   const fullURL = `${ANNAS_SEARCH_ENDPOINT}${encodedQuery}`;
-
-  console.log(`Visiting URL: ${fullURL}`);
 
   try {
     const response = await axios.get(fullURL, {
@@ -80,23 +82,28 @@ export async function findBook(query: string): Promise<Book[]> {
 
     $('a[href^="/md5/"]').each((_, element) => {
       const $el = $(element);
-      const $parent = $el.parent();
 
-      const meta = $parent
-        .find('div.relative.top-\\[-1\\].pl-4.grow.overflow-hidden > div')
-        .eq(0)
-        .text();
-      const title = $parent
-        .find('div.relative.top-\\[-1\\].pl-4.grow.overflow-hidden > h3')
-        .text();
-      const publisher = $parent
-        .find('div.relative.top-\\[-1\\].pl-4.grow.overflow-hidden > div')
-        .eq(1)
-        .text();
-      const authors = $parent
-        .find('div.relative.top-\\[-1\\].pl-4.grow.overflow-hidden > div')
-        .eq(2)
-        .text();
+      // Only process the main book link, not cover images
+      if ($el.hasClass('custom-a') && $el.hasClass('block')) {
+        return; // Skip cover image links
+      }
+
+      const $container = $el.closest('div').parent();
+
+      // Title is in the link itself
+      const title = $el.text();
+
+      // Meta info is in the last div (contains language, format, size)
+      // Extract just the text before "Save" button
+      const metaDiv = $container.find('div.text-gray-800');
+      const metaText = metaDiv.contents().filter((_, el) => el.type === 'text').text();
+      const meta = metaText.split('·').slice(0, 3).join('·').trim();
+
+      // Author link
+      const authors = $container.find('a[href*="/search?q="]').first().text().trim();
+
+      // Publisher link
+      const publisher = $container.find('a[href*="/search?q="]').eq(1).text().trim();
 
       const { language, format, size } = extractMetaInformation(meta);
 
@@ -120,6 +127,21 @@ export async function findBook(query: string): Promise<Book[]> {
     return bookList;
   } catch (error) {
     throw new Error(`Failed to find books: ${error}`);
+  }
+}
+
+/**
+ * Verify that a downloaded file exists and is valid
+ */
+export function verifyDownload(filePath: string): boolean {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return false;
+    }
+    const stats = fs.statSync(filePath);
+    return stats.size > 0;
+  } catch (error) {
+    return false;
   }
 }
 
@@ -159,7 +181,7 @@ export async function downloadBook(
     // Write file using stream pipeline
     const writer = fs.createWriteStream(filePath);
     await pipeline(downloadResp.data, writer);
-  } catch (error) {
+  } catch (error: any) {
     throw new Error(`Failed to download book: ${error}`);
   }
 }
@@ -195,9 +217,34 @@ export function readCSV(csvPath: string): CSVRow[] {
     columns: true,
     skip_empty_lines: true,
     trim: true,
+    relax_column_count: true,
   }) as CSVRow[];
 
   return records;
+}
+
+/**
+ * Update CSV file with status for a specific row
+ */
+export function updateCSVStatus(
+  csvPath: string,
+  rowIndex: number,
+  status: string
+): void {
+  const rows = readCSV(csvPath);
+
+  // Update the status for the specified row
+  if (rowIndex >= 0 && rowIndex < rows.length) {
+    rows[rowIndex].status = status;
+  }
+
+  // Write back to CSV
+  const output = stringify(rows, {
+    header: true,
+    columns: ['author', 'title', 'status'],
+  });
+
+  fs.writeFileSync(csvPath, output, 'utf-8');
 }
 
 /**
@@ -206,6 +253,7 @@ export function readCSV(csvPath: string): CSVRow[] {
 export function loadConfig(): Config {
   const secretKey = process.env.ANNAS_SECRET_KEY;
   const outputFolder = process.env.OUTPUT_FOLDER || './downloads';
+  const maxDownloads = process.env.MAX_DOWNLOADS ? parseInt(process.env.MAX_DOWNLOADS, 10) : undefined;
 
   if (!secretKey) {
     throw new Error('ANNAS_SECRET_KEY environment variable is required');
@@ -221,6 +269,7 @@ export function loadConfig(): Config {
     outputFolder,
     preferredFormat: process.env.PREFERRED_FORMAT,
     preferredLanguage: process.env.PREFERRED_LANGUAGE,
+    maxDownloads,
   };
 }
 
@@ -257,16 +306,38 @@ export function filterBooks(books: Book[], config: Config): Book | null {
  */
 export async function processCSV(csvPath: string, config: Config): Promise<void> {
   const rows = readCSV(csvPath);
-  console.log(`Found ${rows.length} books to download\n`);
+  const totalBooks = rows.length;
+  const maxDownloads = config.maxDownloads;
+
+  console.log(`Found ${totalBooks} books in CSV`);
+  if (maxDownloads) {
+    console.log(`Download limit: ${maxDownloads} books\n`);
+  } else {
+    console.log('No download limit set\n');
+  }
 
   let successCount = 0;
   let failCount = 0;
+  let skippedCount = 0;
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const bookNum = i + 1;
 
-    console.log(`[${bookNum}/${rows.length}] Processing: "${row.title}" by ${row.author}`);
+    // Skip if already downloaded
+    if (row.status === 'downloaded') {
+      console.log(`[${bookNum}/${totalBooks}] Skipping "${row.title}" by ${row.author} (already downloaded)`);
+      skippedCount++;
+      continue;
+    }
+
+    // Check if we've reached the download limit
+    if (maxDownloads && successCount >= maxDownloads) {
+      console.log(`\nReached download limit of ${maxDownloads} books. Stopping.`);
+      break;
+    }
+
+    console.log(`[${bookNum}/${totalBooks}] Processing: "${row.title}" by ${row.author}`);
 
     try {
       // Search for the book
@@ -275,6 +346,7 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
 
       if (books.length === 0) {
         console.log(`  ❌ No results found\n`);
+        updateCSVStatus(csvPath, i, 'failed');
         failCount++;
         continue;
       }
@@ -283,6 +355,7 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
       const selectedBook = filterBooks(books, config);
       if (!selectedBook) {
         console.log(`  ❌ No matching books found after filtering\n`);
+        updateCSVStatus(csvPath, i, 'failed');
         failCount++;
         continue;
       }
@@ -291,10 +364,24 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
 
       // Download the book
       await downloadBook(selectedBook, config.secretKey, config.outputFolder);
-      console.log(`  ✅ Downloaded successfully\n`);
-      successCount++;
+
+      // Verify the download
+      let filename = `${selectedBook.title}.${selectedBook.format}`;
+      filename = filename.replace(/\//g, '');
+      const filePath = path.join(config.outputFolder, filename);
+
+      if (verifyDownload(filePath)) {
+        console.log(`  ✅ Downloaded and verified successfully\n`);
+        updateCSVStatus(csvPath, i, 'downloaded');
+        successCount++;
+      } else {
+        console.log(`  ❌ Download verification failed\n`);
+        updateCSVStatus(csvPath, i, 'failed');
+        failCount++;
+      }
     } catch (error) {
       console.log(`  ❌ Error: ${error}\n`);
+      updateCSVStatus(csvPath, i, 'failed');
       failCount++;
     }
 
@@ -305,7 +392,10 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
   }
 
   console.log('='.repeat(50));
-  console.log(`Download complete: ${successCount} succeeded, ${failCount} failed`);
+  console.log(`Download complete:`);
+  console.log(`  ✅ ${successCount} succeeded`);
+  console.log(`  ❌ ${failCount} failed`);
+  console.log(`  ⏭️  ${skippedCount} skipped`);
   console.log('='.repeat(50));
 }
 

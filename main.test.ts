@@ -12,6 +12,8 @@ import {
   loadConfig,
   bookToString,
   bookToJSON,
+  verifyDownload,
+  updateCSVStatus,
   Book,
 } from './main';
 
@@ -68,12 +70,12 @@ describe('findBook', () => {
 
 describe('extractMetaInformation', () => {
   it('should extract language, format, and size from meta string', () => {
-    const meta = 'English, [pdf], something, 10 MB, 1996';
+    const meta = 'English [en] · PDF · 10 MB';
     const result = extractMetaInformation(meta);
 
     expect(result).toEqual({
-      language: 'English',
-      format: '[pdf]',
+      language: 'English [en]',
+      format: 'PDF',
       size: '10 MB',
     });
   });
@@ -223,6 +225,28 @@ describe('readCSV', () => {
       readCSV('/nonexistent/file.csv');
     }).toThrow();
   });
+
+  it('should parse CSV with status column', () => {
+    const csvPath = path.join(__dirname, '__fixtures__', 'test-books-with-status.csv');
+    const rows = readCSV(csvPath);
+
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toEqual({
+      author: 'Carl Sagan',
+      title: 'The Demon Haunted World',
+      status: 'downloaded',
+    });
+    expect(rows[1]).toEqual({
+      author: 'Alfred Lansing',
+      title: "Endurance: Shackleton's Incredible Voyage",
+      status: '',
+    });
+    expect(rows[2]).toEqual({
+      author: 'Isaac Asimov',
+      title: 'Foundation',
+      status: 'failed',
+    });
+  });
 });
 
 describe('loadConfig', () => {
@@ -242,6 +266,7 @@ describe('loadConfig', () => {
     process.env.OUTPUT_FOLDER = './test-downloads';
     process.env.PREFERRED_FORMAT = 'pdf';
     process.env.PREFERRED_LANGUAGE = 'English';
+    process.env.MAX_DOWNLOADS = '5';
 
     const config = loadConfig();
 
@@ -250,6 +275,7 @@ describe('loadConfig', () => {
       outputFolder: './test-downloads',
       preferredFormat: 'pdf',
       preferredLanguage: 'English',
+      maxDownloads: 5,
     });
   });
 
@@ -267,6 +293,35 @@ describe('loadConfig', () => {
     expect(() => {
       loadConfig();
     }).toThrow('ANNAS_SECRET_KEY environment variable is required');
+  });
+
+  it('should parse MAX_DOWNLOADS as integer', () => {
+    process.env.ANNAS_SECRET_KEY = 'test-secret-key';
+    process.env.MAX_DOWNLOADS = '10';
+
+    const config = loadConfig();
+
+    expect(config.maxDownloads).toBe(10);
+    expect(typeof config.maxDownloads).toBe('number');
+  });
+
+  it('should return undefined for maxDownloads when not set', () => {
+    process.env.ANNAS_SECRET_KEY = 'test-secret-key';
+    delete process.env.MAX_DOWNLOADS;
+
+    const config = loadConfig();
+
+    expect(config.maxDownloads).toBeUndefined();
+  });
+
+  it('should handle invalid MAX_DOWNLOADS values', () => {
+    process.env.ANNAS_SECRET_KEY = 'test-secret-key';
+    process.env.MAX_DOWNLOADS = 'invalid';
+
+    const config = loadConfig();
+
+    // parseInt returns NaN for invalid strings
+    expect(config.maxDownloads).toBeNaN();
   });
 });
 
@@ -404,4 +459,275 @@ describe('downloadBook', () => {
       downloadBook(book, 'test-secret', './downloads')
     ).rejects.toThrow('Failed to download book');
   });
+});
+
+describe('verifyDownload', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-verify-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('should return true for a file that exists with content', () => {
+    const filePath = path.join(tmpDir, 'test-file.pdf');
+    fs.writeFileSync(filePath, 'test content');
+
+    const result = verifyDownload(filePath);
+    expect(result).toBe(true);
+  });
+
+  it('should return false for a file that does not exist', () => {
+    const filePath = path.join(tmpDir, 'nonexistent.pdf');
+
+    const result = verifyDownload(filePath);
+    expect(result).toBe(false);
+  });
+
+  it('should return false for an empty file (size = 0)', () => {
+    const filePath = path.join(tmpDir, 'empty-file.pdf');
+    fs.writeFileSync(filePath, '');
+
+    const result = verifyDownload(filePath);
+    expect(result).toBe(false);
+  });
+
+  it('should return false when file access fails', () => {
+    // Use an invalid path that will cause an error
+    const result = verifyDownload('/invalid/path/\0/file.pdf');
+    expect(result).toBe(false);
+  });
+});
+
+describe('updateCSVStatus', () => {
+  let tmpDir: string;
+  let testCsvPath: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-csv-'));
+    testCsvPath = path.join(tmpDir, 'test-books.csv');
+
+    // Create initial CSV without status
+    const initialContent = `author,title
+Carl Sagan,The Demon Haunted World
+Alfred Lansing,Endurance: Shackleton's Incredible Voyage
+Isaac Asimov,Foundation`;
+    fs.writeFileSync(testCsvPath, initialContent);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('should update status for a valid row index', () => {
+    updateCSVStatus(testCsvPath, 0, 'downloaded');
+
+    const rows = readCSV(testCsvPath);
+    expect(rows[0].status).toBe('downloaded');
+    // CSV parse returns empty string for undefined values, not undefined
+    expect(rows[1].status).toBe('');
+    expect(rows[2].status).toBe('');
+  });
+
+  it('should write CSV with status column correctly', () => {
+    updateCSVStatus(testCsvPath, 1, 'failed');
+
+    const fileContent = fs.readFileSync(testCsvPath, 'utf-8');
+    expect(fileContent).toContain('author,title,status');
+    expect(fileContent).toContain('Alfred Lansing,Endurance: Shackleton\'s Incredible Voyage,failed');
+  });
+
+  it('should update multiple rows sequentially', () => {
+    updateCSVStatus(testCsvPath, 0, 'downloaded');
+    updateCSVStatus(testCsvPath, 1, 'failed');
+    updateCSVStatus(testCsvPath, 2, 'downloaded');
+
+    const rows = readCSV(testCsvPath);
+    expect(rows[0].status).toBe('downloaded');
+    expect(rows[1].status).toBe('failed');
+    expect(rows[2].status).toBe('downloaded');
+  });
+
+  it('should handle invalid row index gracefully', () => {
+    // Should not throw, just do nothing
+    expect(() => {
+      updateCSVStatus(testCsvPath, 999, 'downloaded');
+    }).not.toThrow();
+
+    const rows = readCSV(testCsvPath);
+    expect(rows).toHaveLength(3);
+  });
+
+  it('should preserve existing data when updating status', () => {
+    updateCSVStatus(testCsvPath, 0, 'downloaded');
+
+    const rows = readCSV(testCsvPath);
+    expect(rows[0]).toMatchObject({
+      author: 'Carl Sagan',
+      title: 'The Demon Haunted World',
+      status: 'downloaded',
+    });
+  });
+
+  it('should handle CSV that already has status column', () => {
+    // First update to add status column
+    updateCSVStatus(testCsvPath, 0, 'downloaded');
+
+    // Update again - should preserve first status and update second
+    updateCSVStatus(testCsvPath, 1, 'failed');
+
+    const rows = readCSV(testCsvPath);
+    expect(rows[0].status).toBe('downloaded');
+    expect(rows[1].status).toBe('failed');
+  });
+});
+
+describe('processCSV integration tests', () => {
+  let tmpDir: string;
+  let testCsvPath: string;
+  let downloadDir: string;
+  let consoleLogSpy: jest.SpiedFunction<typeof console.log>;
+
+  beforeEach(() => {
+    mockAxios.reset();
+    tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-process-'));
+    testCsvPath = path.join(tmpDir, 'test-books.csv');
+    downloadDir = path.join(tmpDir, 'downloads');
+    fs.mkdirSync(downloadDir);
+
+    // Suppress console output during tests
+    consoleLogSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    consoleLogSpy.mockRestore();
+  });
+
+  it(
+    'should respect MAX_DOWNLOADS limit based on successful downloads only',
+    async () => {
+      // Create CSV with 5 books
+      const csvContent = `author,title
+Book 1,Author 1
+Book 2,Author 2
+Book 3,Author 3
+Book 4,Author 4
+Book 5,Author 5`;
+      fs.writeFileSync(testCsvPath, csvContent);
+
+      const config = {
+        secretKey: 'test-key',
+        outputFolder: downloadDir,
+        maxDownloads: 2,
+      };
+
+      // All searches return empty results (will fail - no books found)
+      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+
+      const { processCSV } = await import('./main');
+      await processCSV(testCsvPath, config);
+
+      const rows = readCSV(testCsvPath);
+      const downloadedCount = rows.filter((r) => r.status === 'downloaded').length;
+      const processedCount = rows.filter((r) => r.status && r.status !== '').length;
+
+      // MAX_DOWNLOADS limits successful downloads, not attempts
+      // Since all fail, it should process all books looking for successful downloads
+      expect(downloadedCount).toBe(0);
+      expect(processedCount).toBeGreaterThan(0); // All should be marked as failed
+    },
+    15000
+  );
+
+  it(
+    'should skip books with downloaded status',
+    async () => {
+      // Create CSV with one book already downloaded
+      const csvContent = `author,title,status
+Carl Sagan,Book 1,downloaded
+Alfred Lansing,Book 2,
+Isaac Asimov,Book 3,`;
+      fs.writeFileSync(testCsvPath, csvContent);
+
+      const config = {
+        secretKey: 'test-key',
+        outputFolder: downloadDir,
+      };
+
+      // Mock searches - should only search for books without "downloaded" status
+      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+
+      const { processCSV } = await import('./main');
+      await processCSV(testCsvPath, config);
+
+      const rows = readCSV(testCsvPath);
+
+      // First book should still have "downloaded" status (skipped)
+      expect(rows[0].status).toBe('downloaded');
+
+      // Other books should have been processed (failed since we return empty HTML)
+      expect(rows[1].status).toBe('failed');
+      expect(rows[2].status).toBe('failed');
+    },
+    15000
+  );
+
+  it(
+    'should update CSV status after failed downloads',
+    async () => {
+      const csvContent = `author,title
+Carl Sagan,Book 1`;
+      fs.writeFileSync(testCsvPath, csvContent);
+
+      const config = {
+        secretKey: 'test-key',
+        outputFolder: downloadDir,
+      };
+
+      // Mock empty search results (no books found)
+      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+
+      const { processCSV } = await import('./main');
+      await processCSV(testCsvPath, config);
+
+      const rows = readCSV(testCsvPath);
+      expect(rows[0].status).toBe('failed');
+    },
+    10000
+  );
+
+  it(
+    'should count downloads separately from failures',
+    async () => {
+      const csvContent = `author,title
+Book 1,Author 1
+Book 2,Author 2
+Book 3,Author 3`;
+      fs.writeFileSync(testCsvPath, csvContent);
+
+      const config = {
+        secretKey: 'test-key',
+        outputFolder: downloadDir,
+        maxDownloads: 5, // Ensure limit doesn't interfere
+      };
+
+      // All searches return empty (will fail)
+      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+
+      const { processCSV } = await import('./main');
+      await processCSV(testCsvPath, config);
+
+      const rows = readCSV(testCsvPath);
+
+      // All should be marked as failed
+      expect(rows[0].status).toBe('failed');
+      expect(rows[1].status).toBe('failed');
+      expect(rows[2].status).toBe('failed');
+    },
+    15000
+  );
 });

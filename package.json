@@ -1,5 +1,6 @@
 {
   "scripts": {
+    "start": "ts-node main.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"
@@ -8,13 +9,17 @@
     "axios": "^1.12.2",
     "cheerio": "^1.1.2",
     "csv-parse": "^6.1.0",
+    "csv-stringify": "^6.6.0",
     "dotenv": "^17.2.2"
   },
   "devDependencies": {
     "@jest/globals": "^30.2.0",
     "@types/jest": "^30.0.0",
+    "@types/node": "^24.6.0",
     "axios-mock-adapter": "^2.1.0",
     "jest": "^30.2.0",
-    "ts-jest": "^29.4.4"
+    "ts-jest": "^29.4.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
   }
 }
