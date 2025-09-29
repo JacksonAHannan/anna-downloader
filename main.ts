@@ -42,7 +42,7 @@ interface Config {
 /**
  * Extract metadata information from meta string
  */
-function extractMetaInformation(meta: string): {
+export function extractMetaInformation(meta: string): {
   language: string;
   format: string;
   size: string;
@@ -105,7 +105,7 @@ export async function findBook(query: string): Promise<Book[]> {
 
       const book: Book = {
         language: language.trim(),
-        format: format.trim().substring(1), // Remove leading bracket
+        format: format.trim().replace(/[\[\]]/g, ''), // Remove brackets
         size: size.trim(),
         title: title.trim(),
         publisher: publisher.trim(),
@@ -227,7 +227,7 @@ export function loadConfig(): Config {
 /**
  * Filter books based on preferences
  */
-function filterBooks(books: Book[], config: Config): Book | null {
+export function filterBooks(books: Book[], config: Config): Book | null {
   if (books.length === 0) return null;
 
   let filtered = books;

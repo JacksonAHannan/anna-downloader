@@ -1,6 +1,20 @@
 {
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
   "dependencies": {
+    "axios": "^1.12.2",
+    "cheerio": "^1.1.2",
     "csv-parse": "^6.1.0",
     "dotenv": "^17.2.2"
+  },
+  "devDependencies": {
+    "@jest/globals": "^30.2.0",
+    "@types/jest": "^30.0.0",
+    "axios-mock-adapter": "^2.1.0",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.4"
   }
 }
