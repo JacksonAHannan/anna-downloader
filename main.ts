@@ -43,6 +43,19 @@ interface Config {
 }
 
 /**
+ * Custom error for rate limiting (429 responses)
+ */
+class RateLimitError extends Error {
+  retryAfter?: number;
+
+  constructor(message: string, retryAfter?: number) {
+    super(message);
+    this.name = 'RateLimitError';
+    this.retryAfter = retryAfter;
+  }
+}
+
+/**
  * Extract metadata information from meta string
  */
 export function extractMetaInformation(meta: string): {
@@ -125,7 +138,14 @@ export async function findBook(query: string): Promise<Book[]> {
     });
 
     return bookList;
-  } catch (error) {
+  } catch (error: any) {
+    // Check for 429 rate limit
+    if (error.response?.status === 429) {
+      const retryAfter = error.response.headers['retry-after']
+        ? parseInt(error.response.headers['retry-after'], 10)
+        : undefined;
+      throw new RateLimitError('Rate limit exceeded (429)', retryAfter);
+    }
     throw new Error(`Failed to find books: ${error}`);
   }
 }
@@ -182,6 +202,13 @@ export async function downloadBook(
     const writer = fs.createWriteStream(filePath);
     await pipeline(downloadResp.data, writer);
   } catch (error: any) {
+    // Check for 429 rate limit
+    if (error.response?.status === 429) {
+      const retryAfter = error.response.headers['retry-after']
+        ? parseInt(error.response.headers['retry-after'], 10)
+        : undefined;
+      throw new RateLimitError('Rate limit exceeded (429)', retryAfter);
+    }
     throw new Error(`Failed to download book: ${error}`);
   }
 }
@@ -380,6 +407,22 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
         failCount++;
       }
     } catch (error) {
+      // Handle rate limiting
+      if (error instanceof RateLimitError) {
+        console.log(`\n${'='.repeat(50)}`);
+        console.log(`⚠️  RATE LIMIT EXCEEDED (429)`);
+        console.log(`Anna's Archive has rate limited this application.`);
+        if (error.retryAfter) {
+          console.log(`Retry after: ${error.retryAfter} seconds`);
+        }
+        console.log(`\nStopping downloads. Summary:`);
+        console.log(`  ✅ ${successCount} succeeded`);
+        console.log(`  ❌ ${failCount} failed`);
+        console.log(`  ⏭️  ${skippedCount} skipped`);
+        console.log(`${'='.repeat(50)}`);
+        process.exit(0);
+      }
+
       console.log(`  ❌ Error: ${error}\n`);
       updateCSVStatus(csvPath, i, 'failed');
       failCount++;
