@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "start": "ts-node main.ts",
+    "start": "tsc main.ts && node main.js books.csv",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"
