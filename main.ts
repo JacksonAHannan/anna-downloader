@@ -8,8 +8,8 @@ import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 
 // Constants
-const ANNAS_SEARCH_ENDPOINT = 'https://annas-archive.org/search?q=';
-const ANNAS_DOWNLOAD_ENDPOINT = 'https://annas-archive.org/dyn/api/fast_download.json';
+const ANNAS_SEARCH_ENDPOINT = 'https://annas-archive.pm/search?q=';
+const ANNAS_DOWNLOAD_ENDPOINT = 'https://annas-archive.pm/dyn/api/fast_download.json';
 
 // Interfaces
 export interface Book {
