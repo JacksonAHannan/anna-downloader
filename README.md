@@ -90,3 +90,63 @@ npm run test:watch
 # Coverage report
 npm run test:coverage
 ```
+
+## Scheduled Downloads (macOS)
+
+To run the downloader automatically every day (useful for working around rate limits), you can set up a launchd job.
+
+### Setup
+
+1. Create the launchd plist file at `~/Library/LaunchAgents/com.anna-downloader.daily.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.anna-downloader.daily</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/anna-downloader/run-downloader.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardErrorPath</key>
+    <string>/path/to/anna-downloader/logs/error.log</string>
+</dict>
+</plist>
+```
+
+2. Update the paths in the plist to match your installation directory.
+
+3. Load the job:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.anna-downloader.daily.plist
+```
+
+### Management Commands
+
+```bash
+# Verify the job is loaded
+launchctl list | grep anna
+
+# Trigger a run immediately
+launchctl start com.anna-downloader.daily
+
+# Check logs
+tail -f logs/downloader.log
+
+# Stop the scheduled job
+launchctl unload ~/Library/LaunchAgents/com.anna-downloader.daily.plist
+
+# Restart after making changes to the plist
+launchctl unload ~/Library/LaunchAgents/com.anna-downloader.daily.plist
+launchctl load ~/Library/LaunchAgents/com.anna-downloader.daily.plist
+```
