@@ -1,5 +1,14 @@
 node_modules/
 downloads/
 logs/
+.ui-runtime/
+ui/dist/
+dist/
 .env
 books.csv
+
+CSVs/
+*.log
+*-qa.csv
+*-qa.js
+client_secret_*.apps.googleusercontent.com.json

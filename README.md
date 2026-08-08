@@ -6,9 +6,11 @@ A TypeScript utility for batch downloading books from Anna's Archive using a CSV
 
 - **Batch processing** - Process multiple books from a CSV file
 - **Smart filtering** - Filter by preferred format (pdf, epub, mobi) and language
-- **Popularity sorting** - Selects the most downloaded version when multiple matches exist
+- **Format-aware fallback** - Prefers PDFs under 50 MB, then other small formats, then larger PDFs, then larger alternative formats
 - **Progress tracking** - CSV status updates track download progress
 - **Resume capability** - Automatically skips already downloaded books
+- **Row-based starts** - Begin a run at any 1-based CSV row without processing earlier entries
+- **Alternative matching** - Skips unsuitable search results and rotates to the next reliable edition
 - **Rate limit handling** - Handles 429 responses gracefully
 - **Download verification** - Validates files exist and have content
 - **Configurable limits** - Set maximum downloads per run
@@ -35,12 +37,29 @@ cp .env.example .env
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ANNAS_SECRET_KEY` | Yes | - | Your Anna's Archive API key for fast downloads |
+| `GOOGLE_BOOKS_KEY` | For list builder | - | Google Books API key used by the local search service |
 | `OUTPUT_FOLDER` | No | `./downloads` | Directory for downloaded books |
 | `PREFERRED_FORMAT` | No | - | Filter by format (pdf, epub, mobi) |
 | `PREFERRED_LANGUAGE` | No | - | Filter by language (English, Spanish, etc.) |
 | `MAX_DOWNLOADS` | No | unlimited | Maximum books to download per run |
 
 ## Usage
+
+### Local web interface
+
+Build and start the browser interface:
+
+```bash
+npm run ui
+```
+
+Then open [http://localhost:4173](http://localhost:4173). Choose a CSV from your computer, review the parsed queue, and select **Start downloads**. The interface reports search, download, completion, skipped, and failure states for each row, including byte-level progress when the download server provides a content length. The secret key remains on the local Node server and is never sent to the browser.
+
+The **Build a book list** tab searches Google Books by keyword, topic/genre, author, title, publisher, or ISBN. Select individual results or all currently loaded results, then either download an `author,title` CSV or send the selection directly to the downloader. Multiple authors are written with semicolons.
+
+Use **Stop** to abort the active request safely. Downloaded files continue to use `OUTPUT_FOLDER` from `.env`.
+
+### Command line
 
 Run with the default `books.csv` file:
 

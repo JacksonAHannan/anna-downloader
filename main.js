@@ -80,8 +80,8 @@ var promises_1 = require("stream/promises");
 var sync_1 = require("csv-parse/sync");
 var sync_2 = require("csv-stringify/sync");
 // Constants
-var ANNAS_SEARCH_ENDPOINT = 'https://annas-archive.pm/search?q=';
-var ANNAS_DOWNLOAD_ENDPOINT = 'https://annas-archive.pm/dyn/api/fast_download.json';
+var ANNAS_SEARCH_ENDPOINT = 'https://annas-archive.gl/search?q=';
+var ANNAS_DOWNLOAD_ENDPOINT = 'https://annas-archive.gl/dyn/api/fast_download.json';
 /**
  * Custom error for rate limiting (429 responses)
  */

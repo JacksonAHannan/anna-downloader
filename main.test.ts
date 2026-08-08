@@ -14,6 +14,13 @@ import {
   bookToJSON,
   verifyDownload,
   updateCSVStatus,
+  updateCSVResult,
+  selectReliableBook,
+  textSimilarity,
+  isPlaceholderAuthor,
+  buildBookSearchQuery,
+  parseFileSizeBytes,
+  RateLimitError,
   Book,
 } from './main';
 
@@ -32,7 +39,7 @@ describe('findBook', () => {
     );
 
     mockAxios
-      .onGet(/annas-archive\.org\/search/)
+      .onGet(/annas-archive\.gl\/search/)
       .reply(200, htmlFixture);
 
     const books = await findBook('Carl Sagan Demon Haunted World');
@@ -57,7 +64,7 @@ describe('findBook', () => {
     );
 
     mockAxios
-      .onGet(/annas-archive\.org\/search/)
+      .onGet(/annas-archive\.gl\/search/)
       .reply(200, htmlFixture);
 
     const books = await findBook('Carl Sagan Demon Haunted World');
@@ -84,7 +91,7 @@ describe('findBook', () => {
     `;
 
     mockAxios
-      .onGet(/annas-archive\.org\/search/)
+      .onGet(/annas-archive\.gl\/search/)
       .reply(200, htmlWithoutDownloads);
 
     const books = await findBook('Test Book');
@@ -95,7 +102,7 @@ describe('findBook', () => {
 
   it('should handle empty search results', async () => {
     mockAxios
-      .onGet(/annas-archive\.org\/search/)
+      .onGet(/annas-archive\.gl\/search/)
       .reply(200, '<html><body></body></html>');
 
     const books = await findBook('NonexistentBook12345');
@@ -105,7 +112,7 @@ describe('findBook', () => {
 
   it('should throw error on network failure', async () => {
     mockAxios
-      .onGet(/annas-archive\.org\/search/)
+      .onGet(/annas-archive\.gl\/search/)
       .networkError();
 
     await expect(findBook('test')).rejects.toThrow('Failed to find books');
@@ -184,7 +191,7 @@ describe('filterBooks', () => {
     },
   ];
 
-  it('should return most downloaded book when no preferences set', () => {
+  it('should return the most popular sub-50-MB book when no preferences are set', () => {
     const config = {
       secretKey: 'test',
       outputFolder: './downloads',
@@ -196,7 +203,7 @@ describe('filterBooks', () => {
     expect(result?.downloadCount).toBe(5000);
   });
 
-  it('should sort by download count and return most downloaded', () => {
+  it('should rank eligible books by download popularity', () => {
     const config = {
       secretKey: 'test',
       outputFolder: './downloads',
@@ -219,7 +226,7 @@ describe('filterBooks', () => {
     expect(result?.downloadCount).toBe(5000);
   });
 
-  it('should filter by language then sort by download count', () => {
+  it('should filter by language then rank by download popularity', () => {
     const booksWithMultipleEnglish: Book[] = [
       {
         title: 'English Book 1',
@@ -293,55 +300,15 @@ describe('filterBooks', () => {
     expect(result?.downloadCount).toBe(3000);
   });
 
-  it('should filter by format then sort by download count', () => {
-    const booksWithMultiplePDF: Book[] = [
-      {
-        title: 'PDF Book 1',
-        authors: 'Author A',
-        publisher: 'Pub A',
-        language: 'English',
-        format: 'pdf',
-        size: '5 MB',
-        url: 'http://example.com/a',
-        hash: 'hashA',
-        downloadCount: 1500,
-      },
-      {
-        title: 'PDF Book 2',
-        authors: 'Author B',
-        publisher: 'Pub B',
-        language: 'English',
-        format: 'pdf',
-        size: '3 MB',
-        url: 'http://example.com/b',
-        hash: 'hashB',
-        downloadCount: 7500,
-      },
-      {
-        title: 'EPUB Book',
-        authors: 'Author C',
-        publisher: 'Pub C',
-        language: 'English',
-        format: 'epub',
-        size: '4 MB',
-        url: 'http://example.com/c',
-        hash: 'hashC',
-        downloadCount: 9000,
-      },
+  it('ignores format preference when ranking by popularity', () => {
+    const booksWithMultipleFormats: Book[] = [
+      { title: 'PDF Book 1', authors: 'Author A', publisher: 'Pub A', language: 'English', format: 'pdf', size: '2 MB', url: 'http://example.com/a', hash: 'hashA', downloadCount: 1500 },
+      { title: 'PDF Book 2', authors: 'Author B', publisher: 'Pub B', language: 'English', format: 'pdf', size: '3 MB', url: 'http://example.com/b', hash: 'hashB', downloadCount: 7500 },
+      { title: 'EPUB Book', authors: 'Author C', publisher: 'Pub C', language: 'English', format: 'epub', size: '4 MB', url: 'http://example.com/c', hash: 'hashC', downloadCount: 9000 },
     ];
+    const config = { secretKey: 'test', outputFolder: './downloads', preferredFormat: 'pdf' };
 
-    const config = {
-      secretKey: 'test',
-      outputFolder: './downloads',
-      preferredFormat: 'pdf',
-    };
-
-    const result = filterBooks(booksWithMultiplePDF, config);
-    // Should return PDF Book 2 (7500 downloads) not PDF Book 1 (1500 downloads)
-    // Even though EPUB has more downloads, format filter should apply first
-    expect(result?.title).toBe('PDF Book 2');
-    expect(result?.format).toBe('pdf');
-    expect(result?.downloadCount).toBe(7500);
+    expect(filterBooks(booksWithMultipleFormats, config)?.title).toBe('EPUB Book');
   });
 
   it('should return null for empty book list', () => {
@@ -354,7 +321,7 @@ describe('filterBooks', () => {
     expect(result).toBeNull();
   });
 
-  it('should fallback to unfiltered list sorted by downloads if no matches found', () => {
+  it('should fallback to the most popular eligible unfiltered book if no matches are found', () => {
     const config = {
       secretKey: 'test',
       outputFolder: './downloads',
@@ -365,6 +332,143 @@ describe('filterBooks', () => {
     // Should fallback to all books and return most downloaded (Book 2 with 5000 downloads)
     expect(result).toBe(mockBooks[1]);
     expect(result?.downloadCount).toBe(5000);
+  });
+});
+
+describe('reliable match selection', () => {
+  const config = { secretKey: 'test', outputFolder: './test', preferredFormat: 'pdf', preferredLanguage: 'English' };
+  const makeBook = (title: string, authors: string): Book => ({
+    title, authors, language: 'English [en]', format: 'PDF', size: '1 MB',
+    publisher: '', url: '', hash: title, downloadCount: 0,
+  });
+
+  it('accepts a title with a descriptive subtitle and matching authors', () => {
+    const result = selectReliableBook(
+      [makeBook('Studies in the Economic History of Southern Africa: Volume Two', 'Konczacki, Z. A; Parpart, Jane L; Shaw, Timothy M')],
+      config,
+      'Studies in the Economic History of Southern Africa',
+      'Z.A. Konczacki; Jane L. Parpart; Timothy M. Shaw'
+    );
+    expect(result.book?.title).toContain('Studies in the Economic History');
+    expect(result.confidence).toBeGreaterThan(0.8);
+  });
+
+  it('rejects a thematically related but incorrect title', () => {
+    const wrong = makeBook('Geopolitics and Geoculture: Essays on the Changing World-System', 'Immanuel Wallerstein');
+    const result = selectReliableBook([wrong], config, 'Botswana in the Modern World-System', 'Jannis Mossmann');
+    expect(result.book).toBeNull();
+    expect(result.bestCandidate).toBe(wrong);
+  });
+
+  it('rotates past an unsuitable popular result to a reliable alternative', () => {
+    const wrong = makeBook('Greek Tragedy: A Literary History', 'Unknown');
+    wrong.downloadCount = 50000;
+    const correct = makeBook('The Complete Plays of Aeschylus', 'Aeschylus');
+    correct.downloadCount = 100;
+    const result = selectReliableBook([wrong, correct], config, 'The Complete Plays of Aeschylus', 'Aeschylus');
+    expect(result.book).toBe(correct);
+  });
+
+  it('uses title-only confidence for anonymous and traditional works', () => {
+    const result = selectReliableBook(
+      [makeBook('Beowulf', 'Seamus Heaney')],
+      config,
+      'Beowulf',
+      'Anonymous / Traditional European'
+    );
+    expect(result.book?.title).toBe('Beowulf');
+    expect(result.authorScore).toBe(0);
+    expect(result.confidence).toBe(1);
+  });
+
+  it('still rejects an incorrect title for a placeholder author', () => {
+    const result = selectReliableBook(
+      [makeBook('Beowulf: A Translation and Commentary', 'J. R. R. Tolkien')],
+      config,
+      'The Song of Roland',
+      'Anonymous / Traditional European'
+    );
+    expect(result.book).toBeNull();
+  });
+
+  it('chooses the highest-confidence match regardless of file format or size', () => {
+    const exact = makeBook('Beowulf', 'Anonymous');
+    exact.format = 'EPUB';
+    exact.size = '120 MB';
+    exact.downloadCount = 10;
+    const lessExact = makeBook('Beowulf: An Epic Poem', 'Anonymous');
+    lessExact.format = 'PDF';
+    lessExact.size = '900 KB';
+    lessExact.downloadCount = 10000;
+
+    const result = selectReliableBook([lessExact, exact], config, 'Beowulf', 'Anonymous');
+    expect(result.book).toBe(exact);
+    expect(result.confidence).toBe(1);
+  });
+
+  it('uses popularity only to break equal-confidence ties', () => {
+    const lessPopular = makeBook('Beowulf', 'Anonymous');
+    lessPopular.format = 'PDF';
+    lessPopular.size = '1 MB';
+    lessPopular.downloadCount = 10;
+    const popular = makeBook('Beowulf', 'Anonymous');
+    popular.format = 'EPUB';
+    popular.size = '120 MB';
+    popular.downloadCount = 10000;
+
+    expect(selectReliableBook([lessPopular, popular], config, 'Beowulf', 'Anonymous').book).toBe(popular);
+  });
+  it('normalizes punctuation and accents in similarity comparisons', () => {
+    expect(textSimilarity('García Márquez', 'Garcia-Marquez')).toBe(1);
+  });
+
+  it('rejects a formatless edition', () => {
+    const formatless = makeBook('A History of the Modern Middle East: Rulers, Rebels, and Rogues', 'Betty S. Anderson');
+    formatless.format = '';
+    const result = selectReliableBook([formatless], config, 'A History of the Modern Middle East', 'Betty S. Anderson');
+    expect(result.book).toBeNull();
+    expect(result.bestCandidate).toBeNull();
+  });
+});
+
+describe('book search queries', () => {
+  it.each(['Anonymous', 'Anonymous / Traditional Chinese', 'Buddhist Tradition', 'Vyasa / Traditional'])(
+    'searches by title when the author is a placeholder: %s',
+    (author) => {
+      expect(isPlaceholderAuthor(author)).toBe(true);
+      expect(buildBookSearchQuery(author, 'The Book of Songs')).toBe('The Book of Songs');
+    }
+  );
+
+  it('keeps a real author in the query', () => {
+    expect(isPlaceholderAuthor('Jane Austen')).toBe(false);
+    expect(buildBookSearchQuery('Jane Austen', 'Emma')).toBe('Jane Austen Emma');
+  });
+});
+
+describe('file-size parsing', () => {
+  it('normalizes size units for comparison', () => {
+    expect(parseFileSizeBytes('900 KB')).toBe(900 * 1024);
+    expect(parseFileSizeBytes('1.5 MB')).toBe(1.5 * 1024 * 1024);
+    expect(parseFileSizeBytes('2 GiB')).toBe(2 * 1024 ** 3);
+  });
+
+  it('places missing or unrecognized sizes after known sizes', () => {
+    expect(parseFileSizeBytes('')).toBe(Number.POSITIVE_INFINITY);
+    expect(parseFileSizeBytes('unknown')).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+describe('persisted CSV diagnostics', () => {
+  it('writes error and proposed-match details for later inspection', () => {
+    const csvPath = path.join(__dirname, '__fixtures__', 'test-diagnostics-temp.csv');
+    fs.writeFileSync(csvPath, 'author,title\nJannis Mossmann,Botswana in the Modern World-System\n');
+    try {
+      updateCSVResult(csvPath, 0, { status: 'failed', error: 'No reliable match', matched_title: 'Wrong title', matched_author: 'Wrong author', match_confidence: '31' });
+      expect(readCSV(csvPath)[0]).toMatchObject({ status: 'failed', error: 'No reliable match', matched_title: 'Wrong title', match_confidence: '31' });
+    } finally {
+      fs.unlinkSync(csvPath);
+    }
   });
 });
 
@@ -445,6 +549,7 @@ describe('loadConfig', () => {
 
   it('should use default output folder when not specified', () => {
     process.env.ANNAS_SECRET_KEY = 'test-secret-key';
+    delete process.env.OUTPUT_FOLDER;
 
     const config = loadConfig();
 
@@ -573,11 +678,12 @@ describe('downloadBook', () => {
     const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-downloads-'));
 
     try {
-      await downloadBook(book, 'test-secret', tmpDir);
+      const downloadedPath = await downloadBook(book, 'test-secret', tmpDir);
       expect(mockAxios.history.get).toHaveLength(2);
 
       // Verify file was created
       const expectedFile = path.join(tmpDir, 'Test Book.pdf');
+      expect(downloadedPath).toBe(expectedFile);
       expect(fs.existsSync(expectedFile)).toBe(true);
     } finally {
       // Cleanup
@@ -627,6 +733,110 @@ describe('downloadBook', () => {
     await expect(
       downloadBook(book, 'test-secret', './downloads')
     ).rejects.toThrow('Failed to download book');
+  });
+
+  it('rejects and removes an empty download instead of reporting success', async () => {
+    const book: Book = {
+      title: 'Empty Book', authors: 'Test Author', publisher: '', language: 'English',
+      format: 'PDF', size: '0 B', url: '', hash: 'empty-hash', downloadCount: 0,
+    };
+    const { Readable } = require('stream');
+    const emptyStream = new Readable({ read() { this.push(null); } });
+    mockAxios.onGet(/fast_download\.json/).reply(200, { download_url: 'https://example.com/empty.pdf' });
+    mockAxios.onGet('https://example.com/empty.pdf').reply(200, emptyStream, { 'content-length': '0' });
+    const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-empty-download-'));
+    try {
+      await expect(downloadBook(book, 'test-secret', tmpDir)).rejects.toThrow('Downloaded file is empty');
+      expect(fs.existsSync(path.join(tmpDir, 'Empty Book.PDF'))).toBe(false);
+      expect(fs.existsSync(path.join(tmpDir, 'Empty Book.PDF.part'))).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects editions that have no file format', async () => {
+    const book: Book = {
+      title: 'Formatless Book', authors: 'Test Author', publisher: '', language: 'English',
+      format: '', size: '', url: '', hash: 'formatless-hash', downloadCount: 0,
+    };
+    const { Readable } = require('stream');
+    const stream = Readable.from(['content']);
+    mockAxios.onGet(/fast_download\.json/).reply(200, { download_url: 'https://example.com/book' });
+    mockAxios.onGet('https://example.com/book').reply(200, stream);
+    await expect(downloadBook(book, 'test-secret', './downloads')).rejects.toThrow('does not specify a file format');
+  });
+
+  it('stops immediately when the fast quota limit is confirmed', async () => {
+    const book: Book = {
+      title: 'Slow Book', authors: 'Test Author', publisher: '', language: 'English',
+      format: 'PDF', size: '7 B', url: 'https://annas-archive.gl/md5/slow-hash', hash: 'slow-hash', downloadCount: 0,
+    };
+    mockAxios.onGet(/fast_download\.json/).reply(429, { error: 'Daily limit reached' });
+    const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-slow-download-'));
+    try {
+      await expect(downloadBook(book, 'test-secret', tmpDir)).rejects.toThrow(RateLimitError);
+      expect(mockAxios.history.get.some((request) => request.url === book.url)).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('detects a quota message returned with HTTP 200', async () => {
+    const book: Book = {
+      title: 'Quota Book', authors: 'Test Author', publisher: '', language: 'English',
+      format: 'PDF', size: '7 B', url: 'https://annas-archive.gl/md5/quota-hash', hash: 'quota-hash', downloadCount: 0,
+    };
+    mockAxios.onGet(/fast_download\.json/).reply(200, { error: 'You have reached your daily fast download quota' });
+    await expect(downloadBook(book, 'test-secret', './downloads')).rejects.toThrow(RateLimitError);
+    expect(mockAxios.history.get).toHaveLength(1);
+  });
+
+  it('retries the fast route before probing slow links', async () => {
+    const book: Book = {
+      title: 'Retry Book', authors: 'Test Author', publisher: '', language: 'English',
+      format: 'PDF', size: '7 B', url: 'https://annas-archive.gl/md5/retry-hash', hash: 'retry-hash', downloadCount: 0,
+    };
+    const { Readable } = require('stream');
+    let fastRequests = 0;
+    mockAxios.onGet(/fast_download\.json/).reply(() => {
+      fastRequests++;
+      return fastRequests < 3
+        ? [503, { error: 'Temporary fast service failure' }]
+        : [200, { download_url: 'https://fast.example/retry.pdf' }];
+    });
+    mockAxios.onGet('https://fast.example/retry.pdf')
+      .reply(200, Readable.from(['content']), { 'content-type': 'application/pdf', 'content-length': '7' });
+    const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-fast-retry-'));
+    const transfers: string[] = [];
+    try {
+      await downloadBook(book, 'test-secret', tmpDir, (_progress, transfer) => {
+        if (transfer) transfers.push(transfer.route);
+      });
+      expect(fastRequests).toBe(3);
+      expect(mockAxios.history.get.some((request) => request.url === book.url)).toBe(false);
+      expect(transfers).toContain('fast');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries a fast mirror through public DNS when local DNS returns ENOTFOUND', async () => {
+    const book: Book = {
+      title: 'DNS Book', authors: 'Test Author', publisher: '', language: 'English',
+      format: 'PDF', size: '7 B', url: '', hash: 'dns-hash', downloadCount: 0,
+    };
+    const { Readable } = require('stream');
+    mockAxios.onGet(/fast_download\.json/).reply(200, { download_url: 'https://mirror.invalid/file.pdf' });
+    mockAxios.onGet('https://mirror.invalid/file.pdf').reply(() => Promise.reject(Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' })));
+    mockAxios.onGet('https://dns.google/resolve').reply(200, { Answer: [{ type: 1, data: '192.0.2.10' }] });
+    mockAxios.onGet('https://192.0.2.10/file.pdf').reply(200, Readable.from(['content']), { 'content-type': 'application/pdf', 'content-length': '7' });
+    const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-dns-download-'));
+    try {
+      const result = await downloadBook(book, 'test-secret', tmpDir);
+      expect(fs.statSync(result).size).toBe(7);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -795,7 +1005,7 @@ Book 5,Author 5`;
       };
 
       // All searches return empty results (will fail - no books found)
-      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -817,7 +1027,7 @@ Book 5,Author 5`;
     async () => {
       // Create CSV with one book already downloaded
       const csvContent = `author,title,status
-Carl Sagan,Book 1,downloaded
+Carl Sagan,Book 1, Downloaded 
 Alfred Lansing,Book 2,
 Isaac Asimov,Book 3,`;
       fs.writeFileSync(testCsvPath, csvContent);
@@ -828,7 +1038,7 @@ Isaac Asimov,Book 3,`;
       };
 
       // Mock searches - should only search for books without "downloaded" status
-      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -836,7 +1046,7 @@ Isaac Asimov,Book 3,`;
       const rows = readCSV(testCsvPath);
 
       // First book should still have "downloaded" status (skipped)
-      expect(rows[0].status).toBe('downloaded');
+      expect(rows[0].status?.trim().toLowerCase()).toBe('downloaded');
 
       // Other books should have been processed (failed since we return empty HTML)
       expect(rows[1].status).toBe('failed');
@@ -858,7 +1068,7 @@ Carl Sagan,Book 1`;
       };
 
       // Mock empty search results (no books found)
-      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -885,7 +1095,7 @@ Book 3,Author 3`;
       };
 
       // All searches return empty (will fail)
-      mockAxios.onGet(/annas-archive\.org\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -899,4 +1109,17 @@ Book 3,Author 3`;
     },
     15000
   );
+
+  it('starts processing at the requested zero-based index', async () => {
+    fs.writeFileSync(testCsvPath, 'author,title\nAuthor 1,Book 1\nAuthor 2,Book 2\nAuthor 3,Book 3\n');
+    mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
+
+    const { processCSV } = await import('./main');
+    await processCSV(testCsvPath, { secretKey: 'test-key', outputFolder: downloadDir }, { startIndex: 2 });
+
+    const rows = readCSV(testCsvPath);
+    expect(rows[0].status || '').toBe('');
+    expect(rows[1].status || '').toBe('');
+    expect(rows[2].status).toBe('failed');
+  });
 });

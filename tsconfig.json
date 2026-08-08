@@ -8,6 +8,8 @@
     "resolveJsonModule": true,
     "outDir": "./dist"
   },
+  "include": ["main.ts", "server.ts"],
+  "exclude": ["ui", "node_modules", "**/*.test.ts"],
   "ts-node": {
     "esm": false,
     "transpileOnly": true

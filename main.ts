@@ -4,12 +4,18 @@ import * as cheerio from 'cheerio';
 import * as fs from 'fs';
 import * as path from 'path';
 import { pipeline } from 'stream/promises';
+import * as https from 'https';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 
 // Constants
-const ANNAS_SEARCH_ENDPOINT = 'https://annas-archive.pm/search?q=';
-const ANNAS_DOWNLOAD_ENDPOINT = 'https://annas-archive.pm/dyn/api/fast_download.json';
+const ANNAS_BASE_URL = 'https://annas-archive.gl';
+const ANNAS_SEARCH_ENDPOINT = `${ANNAS_BASE_URL}/search?q=`;
+const ANNAS_DOWNLOAD_ENDPOINT = `${ANNAS_BASE_URL}/dyn/api/fast_download.json`;
+
+function optionsAbort(error: unknown, signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted || axios.isCancel(error));
+}
 
 // Interfaces
 export interface Book {
@@ -29,13 +35,35 @@ interface FastDownloadResponse {
   error?: string;
 }
 
-interface CSVRow {
+export interface CSVRow {
   author: string;
   title: string;
   status?: string;
+  error?: string;
+  matched_title?: string;
+  matched_author?: string;
+  match_confidence?: string;
+  download_route?: string;
+  average_speed?: string;
 }
 
-interface Config {
+export interface TransferInfo {
+  route: 'fast' | 'slow';
+  bytesPerSecond: number;
+}
+
+const FAST_DOWNLOAD_ATTEMPTS = 3;
+const REQUEST_TIMEOUT_MS = 20_000;
+const STALL_TIMEOUT_MS = 30_000;
+const SPEED_CHECK_AFTER_MS = 30_000;
+const MIN_TRANSFER_BYTES_PER_SECOND = 32 * 1024;
+
+function formatTransferSpeed(bytesPerSecond: number): string {
+  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
+  return `${Math.round(bytesPerSecond / 1024)} KB/s`;
+}
+
+export interface Config {
   secretKey: string;
   outputFolder: string;
   preferredFormat?: string;
@@ -46,7 +74,7 @@ interface Config {
 /**
  * Custom error for rate limiting (429 responses)
  */
-class RateLimitError extends Error {
+export class RateLimitError extends Error {
   retryAfter?: number;
 
   constructor(message: string, retryAfter?: number) {
@@ -181,46 +209,123 @@ export function verifyDownload(filePath: string): boolean {
 export async function downloadBook(
   book: Book,
   secretKey: string,
-  folderPath: string
-): Promise<void> {
+  folderPath: string,
+  onProgress?: (progress: number, transfer?: TransferInfo) => void,
+  signal?: AbortSignal
+): Promise<string> {
   const apiURL = `${ANNAS_DOWNLOAD_ENDPOINT}?md5=${book.hash}&key=${secretKey}`;
+  const extension = book.format.trim().replace(/^\.+/, '');
+  if (!extension) throw new Error('Failed to download book: The selected edition does not specify a file format');
+  const filename = `${book.title}.${extension}`.replace(/[<>:"/\\|?*]/g, '').trim();
+  const filePath = path.join(folderPath, filename);
+  const partialPath = `${filePath}.part`;
+  const failures: string[] = [];
 
-  try {
-    // Get download URL from API
-    const apiResp = await axios.get<FastDownloadResponse>(apiURL);
-    const { download_url, error } = apiResp.data;
-
-    if (!download_url) {
-      throw new Error(error || 'Failed to get download URL');
+  const getDownloadResponse = async (downloadUrl: string) => {
+    try {
+      return await axios.get(downloadUrl, { responseType: 'stream' as const, signal, timeout: REQUEST_TIMEOUT_MS });
+    } catch (error: any) {
+      if (error.code !== 'ENOTFOUND') throw error;
+      const parsed = new URL(downloadUrl);
+      const dnsResponse = await axios.get('https://dns.google/resolve', { params: { name: parsed.hostname, type: 'A' }, signal });
+      const address = dnsResponse.data?.Answer?.find((answer: any) => answer.type === 1)?.data;
+      if (!address) throw error;
+      parsed.hostname = address;
+      return axios.get(parsed.toString(), {
+        responseType: 'stream' as const,
+        signal,
+        timeout: REQUEST_TIMEOUT_MS,
+        headers: { Host: new URL(downloadUrl).hostname },
+        httpsAgent: new https.Agent({ servername: new URL(downloadUrl).hostname }),
+      });
     }
+  };
 
-    // Download the file
-    const downloadResp = await axios.get(download_url, {
-      responseType: 'stream',
+  const attemptUrl = async (downloadUrl: string, route: TransferInfo['route']): Promise<string> => {
+    const downloadResp = await getDownloadResponse(downloadUrl);
+    const contentType = String(downloadResp.headers['content-type'] || '').toLowerCase();
+    if (downloadResp.status !== 200 || contentType.includes('text/html')) throw new Error(`Download endpoint returned ${downloadResp.status} ${contentType || 'without a file type'}`);
+    const contentLength = Number(downloadResp.headers['content-length']) || 0;
+    let downloadedBytes = 0;
+    const startedAt = Date.now();
+    let lastDataAt = startedAt;
+    const monitor = setInterval(() => {
+      const now = Date.now();
+      const elapsedSeconds = Math.max((now - startedAt) / 1000, 0.001);
+      const bytesPerSecond = downloadedBytes / elapsedSeconds;
+      if (now - lastDataAt >= STALL_TIMEOUT_MS) {
+        downloadResp.data.destroy(new Error(`${route} download stalled for ${STALL_TIMEOUT_MS / 1000} seconds`));
+      } else if (now - startedAt >= SPEED_CHECK_AFTER_MS && bytesPerSecond < MIN_TRANSFER_BYTES_PER_SECOND) {
+        downloadResp.data.destroy(new Error(`${route} download too slow (${formatTransferSpeed(bytesPerSecond)})`));
+      }
+    }, 5_000);
+    monitor.unref?.();
+    downloadResp.data.on('data', (chunk: Buffer) => {
+      downloadedBytes += chunk.length;
+      lastDataAt = Date.now();
+      const bytesPerSecond = downloadedBytes / Math.max((lastDataAt - startedAt) / 1000, 0.001);
+      if (contentLength > 0) onProgress?.(Math.min(99, Math.round((downloadedBytes / contentLength) * 100)), { route, bytesPerSecond });
     });
-
-    if (downloadResp.status !== 200) {
-      throw new Error('Failed to download file');
+    try {
+      await pipeline(downloadResp.data, fs.createWriteStream(partialPath));
+      const writtenSize = fs.statSync(partialPath).size;
+      if (writtenSize === 0) throw new Error('Downloaded file is empty');
+      if (contentLength > 0 && writtenSize !== contentLength) throw new Error(`Incomplete download: expected ${contentLength} bytes but received ${writtenSize}`);
+      fs.renameSync(partialPath, filePath);
+      const bytesPerSecond = writtenSize / Math.max((Date.now() - startedAt) / 1000, 0.001);
+      onProgress?.(100, { route, bytesPerSecond });
+      console.log(`  Transfer: ${route} route at ${formatTransferSpeed(bytesPerSecond)}`);
+      return filePath;
+    } catch (error) {
+      if (fs.existsSync(partialPath)) fs.unlinkSync(partialPath);
+      throw error;
+    } finally {
+      clearInterval(monitor);
     }
+  };
 
-    // Create filename and path
-    let filename = `${book.title}.${book.format}`;
-    filename = filename.replace(/\//g, ''); // Remove slashes
-    const filePath = path.join(folderPath, filename);
-
-    // Write file using stream pipeline
-    const writer = fs.createWriteStream(filePath);
-    await pipeline(downloadResp.data, writer);
-  } catch (error: any) {
-    // Check for 429 rate limit
-    if (error.response?.status === 429) {
-      const retryAfter = error.response.headers['retry-after']
-        ? parseInt(error.response.headers['retry-after'], 10)
-        : undefined;
-      throw new RateLimitError('Rate limit exceeded (429)', retryAfter);
+  // Prefer the authenticated fast API. A confirmed quota response pauses the
+  // entire run; only non-quota fast failures are eligible for slow fallback.
+  for (let attempt = 1; attempt <= FAST_DOWNLOAD_ATTEMPTS; attempt++) {
+    try {
+      const apiResp = await axios.get<FastDownloadResponse>(apiURL, { signal, timeout: REQUEST_TIMEOUT_MS });
+      if (!apiResp.data.download_url) {
+        const message = apiResp.data.error || 'Fast-download URL unavailable';
+        if (/\b(?:daily\s+)?limit\b|\bquota\b|too many fast downloads/i.test(message)) throw new RateLimitError(message);
+        throw new Error(message);
+      }
+      return await attemptUrl(apiResp.data.download_url, 'fast');
+    } catch (error: any) {
+      if (optionsAbort(error, signal)) throw error;
+      if (error instanceof RateLimitError) throw error;
+      if (error.response?.status === 429) {
+        const retryAfter = error.response.headers?.['retry-after'] ? Number(error.response.headers['retry-after']) : undefined;
+        throw new RateLimitError(error.response.data?.error || 'Fast-download limit reached (429)', retryAfter);
+      }
+      failures.push(`fast attempt ${attempt}: ${error.message || error}`);
+      if (error.response?.status === 401 || error.response?.status === 403) break;
+      if (attempt < FAST_DOWNLOAD_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
     }
-    throw new Error(`Failed to download book: ${error}`);
   }
+
+  // Probe the slow partner links exposed on the edition page in order.
+  try {
+    const editionResponse = await axios.get(book.url || `${ANNAS_BASE_URL}/md5/${book.hash}`, { signal });
+    const page = cheerio.load(editionResponse.data);
+    const slowUrls = [...new Set(page('a[href^="/slow_download/"]').map((_index, element) => new URL(page(element).attr('href')!, ANNAS_BASE_URL).toString()).get())];
+    for (const slowUrl of slowUrls) {
+      try { return await attemptUrl(slowUrl, 'slow'); }
+      catch (error: any) {
+        if (optionsAbort(error, signal)) throw error;
+        failures.push(`slow: ${error.message || error}`);
+      }
+    }
+    if (!slowUrls.length) failures.push('slow: no slow partner links were available');
+  } catch (error: any) {
+    if (optionsAbort(error, signal)) throw error;
+    failures.push(`slow probe: ${error.message || error}`);
+  }
+  throw new Error(`Failed to download book: ${failures.join(' | ')}`);
 }
 
 /**
@@ -284,6 +389,20 @@ export function updateCSVStatus(
   fs.writeFileSync(csvPath, output, 'utf-8');
 }
 
+export function updateCSVResult(
+  csvPath: string,
+  rowIndex: number,
+  result: Partial<Pick<CSVRow, 'status' | 'error' | 'matched_title' | 'matched_author' | 'match_confidence' | 'download_route' | 'average_speed'>>
+): void {
+  const rows = readCSV(csvPath);
+  if (rowIndex >= 0 && rowIndex < rows.length) Object.assign(rows[rowIndex], result);
+  const output = stringify(rows, {
+    header: true,
+    columns: ['author', 'title', 'status', 'error', 'matched_title', 'matched_author', 'match_confidence', 'download_route', 'average_speed'],
+  });
+  fs.writeFileSync(csvPath, output, 'utf-8');
+}
+
 /**
  * Load configuration from environment variables
  */
@@ -326,16 +445,10 @@ export function filterBooks(books: Book[], config: Config): Book | null {
     if (byLanguage.length > 0) filtered = byLanguage;
   }
 
-  // Filter by format if specified
-  if (config.preferredFormat) {
-    const byFormat = filtered.filter(
-      (b) => b.format.toLowerCase() === config.preferredFormat!.toLowerCase()
-    );
-    if (byFormat.length > 0) filtered = byFormat;
-  }
+  // Formatless results cannot produce a safe output filename.
+  filtered = filtered.filter((book) => book.format.trim());
 
-  // Sort by download count (highest first) and return most downloaded
-  filtered.sort((a, b) => b.downloadCount - a.downloadCount);
+  filtered.sort((left, right) => right.downloadCount - left.downloadCount);
 
   return filtered[0] || null;
 }
@@ -343,7 +456,11 @@ export function filterBooks(books: Book[], config: Config): Book | null {
 /**
  * Process CSV and download all books
  */
-export async function processCSV(csvPath: string, config: Config): Promise<void> {
+export async function processCSV(
+  csvPath: string,
+  config: Config,
+  options: ProcessOptions = {}
+): Promise<void> {
   const rows = readCSV(csvPath);
   const totalBooks = rows.length;
   const maxDownloads = config.maxDownloads;
@@ -358,14 +475,22 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
   let successCount = 0;
   let failCount = 0;
   let skippedCount = 0;
+  const pendingReviews: Array<{ rowIndex: number; book: Book; confidence: number }> = [];
+  const startIndex = Math.min(rows.length, Math.max(0, Math.floor(options.startIndex || 0)));
 
-  for (let i = 0; i < rows.length; i++) {
+  for (let i = 0; i < startIndex; i++) {
+    options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: `Before selected start row ${startIndex + 1}` });
+  }
+
+  for (let i = startIndex; i < rows.length; i++) {
+    if (options.signal?.aborted) break;
     const row = rows[i];
     const bookNum = i + 1;
 
     // Skip if already downloaded
-    if (row.status === 'downloaded') {
+    if (row.status?.trim().toLowerCase() === 'downloaded') {
       console.log(`[${bookNum}/${totalBooks}] Skipping "${row.title}" by ${row.author} (already downloaded)`);
+      options.onEvent?.({ rowIndex: i, status: 'skipped', progress: 100 });
       skippedCount++;
       continue;
     }
@@ -380,47 +505,76 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
 
     try {
       // Search for the book
-      const query = `${row.author} ${row.title}`;
+      options.onEvent?.({ rowIndex: i, status: 'searching', progress: 0 });
+      const query = buildBookSearchQuery(row.author, row.title);
       const books = await findBook(query);
 
       if (books.length === 0) {
         console.log(`  ❌ No results found\n`);
-        updateCSVStatus(csvPath, i, 'failed');
+        updateCSVResult(csvPath, i, { status: 'failed', error: 'No results found', matched_title: '', matched_author: '', match_confidence: '' });
+        options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message: 'No results found' });
         failCount++;
         continue;
       }
 
       // Filter and select best match
-      const selectedBook = filterBooks(books, config);
+      const selection = selectReliableBook(books, config, row.title, row.author);
+      const selectedBook = selection.book;
       if (!selectedBook) {
         console.log(`  ❌ No matching books found after filtering\n`);
-        updateCSVStatus(csvPath, i, 'failed');
+        const candidate = selection.bestCandidate;
+        const message = candidate
+          ? `No reliable match (best: "${candidate.title}", ${Math.round(selection.confidence * 100)}% confidence)`
+          : 'No matching edition found';
+        updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: candidate?.title || '', matched_author: candidate?.authors || '', match_confidence: String(Math.round(selection.confidence * 100)) });
+        options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message, matchTitle: candidate?.title, matchAuthors: candidate?.authors, confidence: selection.confidence });
         failCount++;
         continue;
       }
 
+      updateCSVResult(csvPath, i, { status: 'matched', error: '', matched_title: selectedBook.title, matched_author: selectedBook.authors, match_confidence: String(Math.round(selection.confidence * 100)) });
+      // Matches above 80% download automatically. Lower reliable matches are
+      // deferred so the automatic matching pass can continue to the next row.
+      if (options.confirmMatch && selection.confidence <= 0.8) {
+        pendingReviews.push({ rowIndex: i, book: selectedBook, confidence: selection.confidence });
+        options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: 'Review deferred until automatic matches finish', format: selectedBook.format, size: selectedBook.size, matchTitle: selectedBook.title, matchAuthors: selectedBook.authors, confidence: selection.confidence });
+        continue;
+      }
+      if (options.confirmMatch && selection.confidence > 0.8) {
+        options.onEvent?.({ rowIndex: i, status: 'searching', progress: 0, message: 'High-confidence match; downloading automatically', format: selectedBook.format, size: selectedBook.size, matchTitle: selectedBook.title, matchAuthors: selectedBook.authors, confidence: selection.confidence });
+      }
       console.log(`  📚 Found: ${selectedBook.format} (${selectedBook.size})`);
 
       // Download the book
-      await downloadBook(selectedBook, config.secretKey, config.outputFolder);
-
-      // Verify the download
-      let filename = `${selectedBook.title}.${selectedBook.format}`;
-      filename = filename.replace(/\//g, '');
-      const filePath = path.join(config.outputFolder, filename);
+      options.onEvent?.({ rowIndex: i, status: 'downloading', progress: 0, format: selectedBook.format, size: selectedBook.size });
+      let completedTransfer: TransferInfo | undefined;
+      const filePath = await downloadBook(
+        selectedBook,
+        config.secretKey,
+        config.outputFolder,
+        (progress, transfer) => {
+          if (transfer) completedTransfer = transfer;
+          options.onEvent?.({ rowIndex: i, status: 'downloading', progress, format: selectedBook.format, size: selectedBook.size, message: transfer ? `${transfer.route} route · ${formatTransferSpeed(transfer.bytesPerSecond)}` : undefined });
+        },
+        options.signal
+      );
 
       if (verifyDownload(filePath)) {
         console.log(`  ✅ Downloaded and verified successfully\n`);
-        updateCSVStatus(csvPath, i, 'downloaded');
+        updateCSVResult(csvPath, i, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' });
+        options.onEvent?.({ rowIndex: i, status: 'completed', progress: 100, format: selectedBook.format, size: selectedBook.size });
         successCount++;
       } else {
         console.log(`  ❌ Download verification failed\n`);
-        updateCSVStatus(csvPath, i, 'failed');
+        updateCSVResult(csvPath, i, { status: 'failed', error: 'Download verification failed' });
+        options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message: 'Download verification failed' });
         failCount++;
       }
     } catch (error) {
       // Handle rate limiting
       if (error instanceof RateLimitError) {
+        updateCSVResult(csvPath, i, { status: 'Not started', error: error.message });
+        options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: error.message });
         console.log(`\n${'='.repeat(50)}`);
         console.log(`⚠️  RATE LIMIT EXCEEDED (429)`);
         console.log(`Anna's Archive has rate limited this application.`);
@@ -432,11 +586,15 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
         console.log(`  ❌ ${failCount} failed`);
         console.log(`  ⏭️  ${skippedCount} skipped`);
         console.log(`${'='.repeat(50)}`);
-        process.exit(0);
+        throw error;
       }
 
+      if (options.signal?.aborted || axios.isCancel(error)) break;
+
       console.log(`  ❌ Error: ${error}\n`);
-      updateCSVStatus(csvPath, i, 'failed');
+      const message = error instanceof Error ? error.message : String(error);
+      updateCSVResult(csvPath, i, { status: 'failed', error: message });
+      options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message });
       failCount++;
     }
 
@@ -446,6 +604,44 @@ export async function processCSV(csvPath: string, config: Config): Promise<void>
     }
   }
 
+  // Review lower-confidence matches after the automatic matching pass.
+  for (const pending of pendingReviews) {
+    if (options.signal?.aborted || (maxDownloads && successCount >= maxDownloads)) break;
+    const { rowIndex, book, confidence } = pending;
+    options.onEvent?.({ rowIndex, status: 'awaiting_confirmation', progress: 0, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence });
+    const decision = await options.confirmMatch!(rowIndex, book, confidence);
+    if (options.signal?.aborted) break;
+    if (decision === 'skip') {
+      updateCSVResult(csvPath, rowIndex, { status: 'skipped', error: 'Skipped by user' });
+      options.onEvent?.({ rowIndex, status: 'skipped', progress: 0, message: 'Skipped by user', matchTitle: book.title, matchAuthors: book.authors, confidence });
+      skippedCount++;
+      continue;
+    }
+    try {
+      options.onEvent?.({ rowIndex, status: 'downloading', progress: 0, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence });
+      let completedTransfer: TransferInfo | undefined;
+      const filePath = await downloadBook(book, config.secretKey, config.outputFolder,
+        (progress, transfer) => {
+          if (transfer) completedTransfer = transfer;
+          options.onEvent?.({ rowIndex, status: 'downloading', progress, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence, message: transfer ? `${transfer.route} route · ${formatTransferSpeed(transfer.bytesPerSecond)}` : undefined });
+        }, options.signal);
+      if (!verifyDownload(filePath)) throw new Error('Download verification failed');
+      updateCSVResult(csvPath, rowIndex, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' });
+      options.onEvent?.({ rowIndex, status: 'completed', progress: 100, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence });
+      successCount++;
+    } catch (error) {
+      if (options.signal?.aborted || axios.isCancel(error)) break;
+      if (error instanceof RateLimitError) {
+        updateCSVResult(csvPath, rowIndex, { status: 'Not started', error: error.message });
+        options.onEvent?.({ rowIndex, status: 'queued', progress: 0, message: error.message, matchTitle: book.title, matchAuthors: book.authors, confidence });
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      updateCSVResult(csvPath, rowIndex, { status: 'failed', error: message });
+      options.onEvent?.({ rowIndex, status: 'failed', progress: 0, message, matchTitle: book.title, matchAuthors: book.authors, confidence });
+      failCount++;
+    }
+  }
   console.log('='.repeat(50));
   console.log(`Download complete:`);
   console.log(`  ✅ ${successCount} succeeded`);
@@ -489,4 +685,107 @@ async function main() {
 // Run main function if this is the entry point
 if (require.main === module) {
   main();
+}
+
+const MATCH_STOP_WORDS = new Set(['a', 'an', 'and', 'by', 'for', 'in', 'of', 'on', 'the', 'to', 'with']);
+
+/** Author labels that describe an unknown or collective origin rather than searchable metadata. */
+export function isPlaceholderAuthor(author: string): boolean {
+  return /\banonymous\b|\btradition(?:al)?\b/i.test(author);
+}
+
+export function buildBookSearchQuery(author: string, title: string): string {
+  return isPlaceholderAuthor(author) ? title.trim() : `${author.trim()} ${title.trim()}`.trim();
+}
+
+export function parseFileSizeBytes(size: string): number {
+  const match = size.trim().match(/^([\d.,]+)\s*(B|KB|KIB|MB|MIB|GB|GIB|TB|TIB)$/i);
+  if (!match) return Number.POSITIVE_INFINITY;
+  const value = Number(match[1].replace(/,/g, ''));
+  if (!Number.isFinite(value)) return Number.POSITIVE_INFINITY;
+  const unit = match[2].toUpperCase();
+  const powers: Record<string, number> = {
+    B: 0, KB: 1, KIB: 1, MB: 2, MIB: 2, GB: 3, GIB: 3, TB: 4, TIB: 4,
+  };
+  return value * (1024 ** powers[unit]);
+}
+
+
+function matchTokens(value: string): string[] {
+  return value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/)
+    .filter((token) => token && !MATCH_STOP_WORDS.has(token));
+}
+
+export function textSimilarity(expected: string, candidate: string): number {
+  const expectedTokens = new Set(matchTokens(expected));
+  const candidateTokens = new Set(matchTokens(candidate));
+  if (!expectedTokens.size || !candidateTokens.size) return 0;
+  const intersection = [...expectedTokens].filter((token) => candidateTokens.has(token)).length;
+  const coverage = intersection / expectedTokens.size;
+  const union = new Set([...expectedTokens, ...candidateTokens]).size;
+  return (coverage * 0.7) + ((intersection / union) * 0.3);
+}
+
+export interface MatchSelection {
+  book: Book | null;
+  confidence: number;
+  titleScore: number;
+  authorScore: number;
+  bestCandidate: Book | null;
+}
+
+export function selectReliableBook(
+  books: Book[],
+  config: Config,
+  expectedTitle: string,
+  expectedAuthor: string,
+  threshold = 0.62
+): MatchSelection {
+  const titleOnly = isPlaceholderAuthor(expectedAuthor);
+  let filtered = [...books];
+  if (config.preferredLanguage) {
+    const preference = config.preferredLanguage.toLowerCase();
+    const matching = filtered.filter((book) => book.language.toLowerCase().startsWith(preference));
+    if (matching.length) filtered = matching;
+  }
+  filtered = filtered.filter((book) => book.format.trim());
+
+  const rankedByConfidence = filtered.map((book) => {
+    const titleScore = textSimilarity(expectedTitle, book.title);
+    const authorScore = titleOnly ? 0 : textSimilarity(expectedAuthor, book.authors);
+    const confidence = titleOnly ? titleScore : (titleScore * 0.8) + (authorScore * 0.2);
+    return { book, titleScore, authorScore, confidence };
+  }).sort((left, right) => right.confidence - left.confidence || right.book.downloadCount - left.book.downloadCount);
+  const bestCandidate = rankedByConfidence[0];
+  if (!bestCandidate) return { book: null, confidence: 0, titleScore: 0, authorScore: 0, bestCandidate: null };
+
+  const reliable = rankedByConfidence
+    .filter((candidate) => candidate.titleScore >= 0.6 && candidate.confidence >= threshold);
+  const selected = reliable[0];
+  if (!selected) {
+    return { book: null, confidence: bestCandidate.confidence, titleScore: bestCandidate.titleScore, authorScore: bestCandidate.authorScore, bestCandidate: bestCandidate.book };
+  }
+  return { book: selected.book, confidence: selected.confidence, titleScore: selected.titleScore, authorScore: selected.authorScore, bestCandidate: selected.book };
+}
+
+export type DownloadStatus = 'queued' | 'searching' | 'awaiting_confirmation' | 'downloading' | 'completed' | 'failed' | 'skipped';
+
+export interface DownloadEvent {
+  rowIndex: number;
+  status: DownloadStatus;
+  progress?: number;
+  format?: string;
+  size?: string;
+  message?: string;
+  matchTitle?: string;
+  matchAuthors?: string;
+  confidence?: number;
+}
+
+export interface ProcessOptions {
+  signal?: AbortSignal;
+  onEvent?: (event: DownloadEvent) => void;
+  confirmMatch?: (rowIndex: number, book: Book, confidence: number) => Promise<'confirm' | 'skip'>;
+  startIndex?: number;
 }
