@@ -4,6 +4,8 @@ logs/
 .ui-runtime/
 ui/dist/
 dist/
+coverage/
+main.js
 .env
 books.csv
 

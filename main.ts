@@ -9,9 +9,10 @@ import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 
 // Constants
-const ANNAS_BASE_URL = 'https://annas-archive.gl';
+const ANNAS_BASE_URL = (process.env.ANNAS_BASE_URL || 'https://annas-archive.is').replace(/\/$/, '');
+const ANNAS_DOWNLOAD_BASE_URL = (process.env.ANNAS_DOWNLOAD_BASE_URL || 'https://annas-archive.gl').replace(/\/$/, '');
 const ANNAS_SEARCH_ENDPOINT = `${ANNAS_BASE_URL}/search?q=`;
-const ANNAS_DOWNLOAD_ENDPOINT = `${ANNAS_BASE_URL}/dyn/api/fast_download.json`;
+const ANNAS_DOWNLOAD_ENDPOINT = `${ANNAS_DOWNLOAD_BASE_URL}/dyn/api/fast_download.json`;
 
 function optionsAbort(error: unknown, signal?: AbortSignal): boolean {
   return Boolean(signal?.aborted || axios.isCancel(error));
@@ -36,6 +37,7 @@ interface FastDownloadResponse {
 }
 
 export interface CSVRow {
+  [column: string]: string | undefined;
   author: string;
   title: string;
   status?: string;
@@ -45,6 +47,14 @@ export interface CSVRow {
   match_confidence?: string;
   download_route?: string;
   average_speed?: string;
+  selected_hash?: string;
+  selected_url?: string;
+  selected_title?: string;
+  selected_authors?: string;
+  selected_publisher?: string;
+  selected_language?: string;
+  selected_format?: string;
+  selected_size?: string;
 }
 
 export interface TransferInfo {
@@ -57,10 +67,22 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const STALL_TIMEOUT_MS = 30_000;
 const SPEED_CHECK_AFTER_MS = 30_000;
 const MIN_TRANSFER_BYTES_PER_SECOND = 32 * 1024;
+const MAX_DOWNLOAD_BASENAME_BYTES = 180;
 
 function formatTransferSpeed(bytesPerSecond: number): string {
   if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
   return `${Math.round(bytesPerSecond / 1024)} KB/s`;
+}
+
+export function safeDownloadFilename(title: string, extension: string, hash: string): string {
+  const cleanExtension = extension.toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+  const suffix = `-${hash.replace(/[^a-z0-9]/gi, '').slice(0, 10) || 'download'}.${cleanExtension}`;
+  let stem = title.normalize('NFKC').replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/[. ]+$/g, '').trim() || 'Untitled';
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) stem = `_${stem}`;
+  while (Buffer.byteLength(stem + suffix, 'utf8') > MAX_DOWNLOAD_BASENAME_BYTES && stem.length > 1) {
+    stem = stem.slice(0, -1).replace(/[. ]+$/g, '');
+  }
+  return `${stem}${suffix}`;
 }
 
 export interface Config {
@@ -68,6 +90,8 @@ export interface Config {
   outputFolder: string;
   preferredFormat?: string;
   preferredLanguage?: string;
+  /** Editions from a publisher whose name contains this text rank slightly higher. See rankCandidates. */
+  preferredPublisher?: string;
   maxDownloads?: number;
 }
 
@@ -81,6 +105,20 @@ export class RateLimitError extends Error {
     super(message);
     this.name = 'RateLimitError';
     this.retryAfter = retryAfter;
+  }
+}
+
+export class SearchAccessError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SearchAccessError';
+  }
+}
+
+export class CatalogMetadataError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CatalogMetadataError';
   }
 }
 
@@ -108,7 +146,8 @@ export function extractMetaInformation(meta: string): {
 /**
  * Find books by search query
  */
-export async function findBook(query: string): Promise<Book[]> {
+export async function findBook(query: string, attemptedQueries = new Set<string>(), catalogMatchesFound = 0): Promise<Book[]> {
+  attemptedQueries.add(query.toLowerCase());
   const encodedQuery = encodeURIComponent(query);
   const fullURL = `${ANNAS_SEARCH_ENDPOINT}${encodedQuery}`;
 
@@ -175,6 +214,43 @@ export async function findBook(query: string): Promise<Book[]> {
       bookList.push(book);
     });
 
+    // The current catalog frontend uses /books/ cards. Its cover filename is
+    // the same MD5 accepted by the stable member download API on the download host.
+    if (bookList.length === 0) {
+      catalogMatchesFound = Math.max(catalogMatchesFound, $('h3 a[href*="/books/"]').length);
+      $('h3 a[href*="/books/"]').each((_, element) => {
+        const $titleLink = $(element);
+        const $card = $titleLink.parents('div').filter((__, parent) => ($(parent).attr('class') || '').includes('bg-white')).first();
+        const details = $titleLink.parent().next('div').text().replace(/\s+/g, ' ').trim().split('·').map((part) => part.trim());
+        const imageUrl = $card.find('img').first().attr('src') || '';
+        const hash = imageUrl.match(/\/([a-f0-9]{32})\.[a-z0-9]+(?:\?|$)/i)?.[1]?.toLowerCase() || '';
+        if (!hash) return;
+        const yearIndex = details.findIndex((part) => /^\d{4}$/.test(part));
+        const format = yearIndex >= 0 ? details[yearIndex + 1] || '' : '';
+        const size = yearIndex >= 0 ? details[yearIndex + 2] || '' : '';
+        const publisherText = $card.find('div').filter((__, child) => $(child).text().trim().startsWith('Publisher:')).first().text().trim();
+        bookList.push({
+          title: $titleLink.text().trim(), authors: details[0] || '', publisher: publisherText.replace(/^Publisher:\s*/i, ''),
+          language: '', format, size, hash, downloadCount: 0,
+          url: `${ANNAS_DOWNLOAD_BASE_URL}/md5/${hash}`,
+        });
+      });
+    }
+
+    if (bookList.length === 0) {
+      const withoutSubtitle = query.replace(/\s*:\s*.+$/, '').trim();
+      const withoutVolume = query.replace(/,?\s+Volume\s+(?:[IVX]+|\d+)(?:\s*:.*)?$/i, '').trim();
+      const withoutAccents = query.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+      const meaningfulWords = withoutAccents.split(/[^a-z0-9]+/i).filter((word) => word && !new Set(['a', 'an', 'and', 'of', 'on', 'the', 'to', 'with']).has(word.toLowerCase()));
+      const fallbacks = [withoutSubtitle, withoutVolume, withoutAccents];
+      for (let length = Math.min(3, meaningfulWords.length - 1); length >= 2; length--) fallbacks.push(meaningfulWords.slice(0, length).join(' '));
+      const fallbackQuery = fallbacks.find((candidate) => candidate && !attemptedQueries.has(candidate.toLowerCase()));
+      if (fallbackQuery) return findBook(fallbackQuery, attemptedQueries, catalogMatchesFound);
+      if (catalogMatchesFound > 0) {
+        throw new CatalogMetadataError(`${catalogMatchesFound} catalog match${catalogMatchesFound === 1 ? '' : 'es'} found, but none exposes an MD5 usable by the download API`);
+      }
+    }
+
     return bookList;
   } catch (error: any) {
     // Check for 429 rate limit
@@ -184,7 +260,20 @@ export async function findBook(query: string): Promise<Book[]> {
         : undefined;
       throw new RateLimitError('Rate limit exceeded (429)', retryAfter);
     }
-    throw new Error(`Failed to find books: ${error}`);
+    if (error instanceof CatalogMetadataError) throw error;
+    if (error.response?.status === 403) {
+      throw new SearchAccessError('Anna\'s Archive blocked automated search with a browser verification challenge (HTTP 403). This is separate from the fast-download quota. Stop the scan and try again later, or configure an official working catalog domain with ANNAS_BASE_URL.');
+    }
+    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+      throw new Error('Book search timed out. Check your connection and retry this row.');
+    }
+    if (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN') {
+      throw new Error('Book search could not reach Anna\'s Archive. Check DNS or internet connectivity.');
+    }
+    if (error.response?.status) {
+      throw new Error(`Book search service returned HTTP ${error.response.status}. Retry later or verify that the search service is available.`);
+    }
+    throw new Error(`Book search failed: ${error.message || String(error)}`);
   }
 }
 
@@ -197,7 +286,18 @@ export function verifyDownload(filePath: string): boolean {
       return false;
     }
     const stats = fs.statSync(filePath);
-    return stats.size > 0;
+    if (stats.size === 0) return false;
+    const extension = path.extname(filePath).toLowerCase();
+    if (extension !== '.pdf' && extension !== '.epub') return true;
+    const descriptor = fs.openSync(filePath, 'r');
+    try {
+      const signature = Buffer.alloc(5);
+      const bytesRead = fs.readSync(descriptor, signature, 0, signature.length, 0);
+      if (extension === '.pdf') return bytesRead >= 5 && signature.toString('ascii') === '%PDF-';
+      return bytesRead >= 4 && signature.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    } finally {
+      fs.closeSync(descriptor);
+    }
   } catch (error) {
     return false;
   }
@@ -216,7 +316,7 @@ export async function downloadBook(
   const apiURL = `${ANNAS_DOWNLOAD_ENDPOINT}?md5=${book.hash}&key=${secretKey}`;
   const extension = book.format.trim().replace(/^\.+/, '');
   if (!extension) throw new Error('Failed to download book: The selected edition does not specify a file format');
-  const filename = `${book.title}.${extension}`.replace(/[<>:"/\\|?*]/g, '').trim();
+  const filename = safeDownloadFilename(book.title, extension, book.hash);
   const filePath = path.join(folderPath, filename);
   const partialPath = `${filePath}.part`;
   const failures: string[] = [];
@@ -310,9 +410,14 @@ export async function downloadBook(
 
   // Probe the slow partner links exposed on the edition page in order.
   try {
-    const editionResponse = await axios.get(book.url || `${ANNAS_BASE_URL}/md5/${book.hash}`, { signal });
+    const editionUrl = `${ANNAS_DOWNLOAD_BASE_URL}/md5/${book.hash}`;
+    const parsedEditionUrl = new URL(editionUrl);
+    if (parsedEditionUrl.protocol !== 'https:' || parsedEditionUrl.hostname !== new URL(ANNAS_DOWNLOAD_BASE_URL).hostname) {
+      throw new Error('Refusing to request an untrusted edition URL');
+    }
+    const editionResponse = await axios.get(editionUrl, { signal, timeout: REQUEST_TIMEOUT_MS });
     const page = cheerio.load(editionResponse.data);
-    const slowUrls = [...new Set(page('a[href^="/slow_download/"]').map((_index, element) => new URL(page(element).attr('href')!, ANNAS_BASE_URL).toString()).get())];
+    const slowUrls = [...new Set(page('a[href^="/slow_download/"]').map((_index, element) => new URL(page(element).attr('href')!, ANNAS_DOWNLOAD_BASE_URL).toString()).get())];
     for (const slowUrl of slowUrls) {
       try { return await attemptUrl(slowUrl, 'slow'); }
       catch (error: any) {
@@ -368,39 +473,32 @@ export function readCSV(csvPath: string): CSVRow[] {
 /**
  * Update CSV file with status for a specific row
  */
-export function updateCSVStatus(
-  csvPath: string,
-  rowIndex: number,
-  status: string
-): void {
-  const rows = readCSV(csvPath);
-
-  // Update the status for the specified row
-  if (rowIndex >= 0 && rowIndex < rows.length) {
-    rows[rowIndex].status = status;
-  }
-
-  // Write back to CSV
-  const output = stringify(rows, {
-    header: true,
-    columns: ['author', 'title', 'status'],
-  });
-
-  fs.writeFileSync(csvPath, output, 'utf-8');
-}
+const MANAGED_DIAGNOSTIC_COLUMNS = [
+  'status', 'error', 'matched_title', 'matched_author', 'match_confidence', 'download_route', 'average_speed',
+  'selected_hash', 'selected_url', 'selected_title', 'selected_authors', 'selected_publisher', 'selected_language', 'selected_format', 'selected_size',
+] as const;
+const MANAGED_CSV_COLUMNS = ['author', 'title', ...MANAGED_DIAGNOSTIC_COLUMNS] as const;
 
 export function updateCSVResult(
   csvPath: string,
   rowIndex: number,
-  result: Partial<Pick<CSVRow, 'status' | 'error' | 'matched_title' | 'matched_author' | 'match_confidence' | 'download_route' | 'average_speed'>>
+  result: Partial<Pick<CSVRow, typeof MANAGED_DIAGNOSTIC_COLUMNS[number]>>,
+  rows = readCSV(csvPath)
 ): void {
-  const rows = readCSV(csvPath);
   if (rowIndex >= 0 && rowIndex < rows.length) Object.assign(rows[rowIndex], result);
+  const originalColumns = rows.flatMap((row) => Object.keys(row));
+  const columns = [...new Set([...originalColumns, ...MANAGED_CSV_COLUMNS])];
   const output = stringify(rows, {
     header: true,
-    columns: ['author', 'title', 'status', 'error', 'matched_title', 'matched_author', 'match_confidence', 'download_route', 'average_speed'],
+    columns,
   });
-  fs.writeFileSync(csvPath, output, 'utf-8');
+  const temporaryPath = `${csvPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, output, 'utf-8');
+    fs.renameSync(temporaryPath, csvPath);
+  } finally {
+    if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+  }
 }
 
 /**
@@ -425,6 +523,7 @@ export function loadConfig(): Config {
     outputFolder,
     preferredFormat: process.env.PREFERRED_FORMAT,
     preferredLanguage: process.env.PREFERRED_LANGUAGE,
+    preferredPublisher: process.env.PREFERRED_PUBLISHER,
     maxDownloads,
   };
 }
@@ -487,9 +586,10 @@ export async function processCSV(
     const row = rows[i];
     const bookNum = i + 1;
 
-    // Skip if already downloaded
-    if (row.status?.trim().toLowerCase() === 'downloaded') {
-      console.log(`[${bookNum}/${totalBooks}] Skipping "${row.title}" by ${row.author} (already downloaded)`);
+    // Skip if already downloaded or explicitly rejected during match review
+    const existingStatus = row.status?.trim().toLowerCase();
+    if (existingStatus === 'downloaded' || existingStatus === 'rejected') {
+      console.log(`[${bookNum}/${totalBooks}] Skipping "${row.title}" by ${row.author} (${existingStatus})`);
       options.onEvent?.({ rowIndex: i, status: 'skipped', progress: 100 });
       skippedCount++;
       continue;
@@ -504,46 +604,65 @@ export async function processCSV(
     console.log(`[${bookNum}/${totalBooks}] Processing: "${row.title}" by ${row.author}`);
 
     try {
-      // Search for the book
-      options.onEvent?.({ rowIndex: i, status: 'searching', progress: 0 });
-      const query = buildBookSearchQuery(row.author, row.title);
-      const books = await findBook(query);
+      let selectedBook: Book;
 
-      if (books.length === 0) {
-        console.log(`  ❌ No results found\n`);
-        updateCSVResult(csvPath, i, { status: 'failed', error: 'No results found', matched_title: '', matched_author: '', match_confidence: '' });
-        options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message: 'No results found' });
-        failCount++;
-        continue;
-      }
+      if (row.selected_hash) {
+        // Already reviewed and chosen during a preliminary match scan — download it directly.
+        selectedBook = {
+          title: row.selected_title || row.title,
+          authors: row.selected_authors || row.author,
+          publisher: row.selected_publisher || '',
+          language: row.selected_language || '',
+          format: row.selected_format || '',
+          size: row.selected_size || '',
+          url: row.selected_url || '',
+          hash: row.selected_hash,
+          downloadCount: 0,
+        };
+        console.log(`  📚 Using pre-selected match: ${selectedBook.format} (${selectedBook.size})`);
+      } else {
+        // Search for the book
+        options.onEvent?.({ rowIndex: i, status: 'searching', progress: 0 });
+        const query = buildBookSearchQuery(row.author, row.title);
+        const books = await findBook(query);
 
-      // Filter and select best match
-      const selection = selectReliableBook(books, config, row.title, row.author);
-      const selectedBook = selection.book;
-      if (!selectedBook) {
-        console.log(`  ❌ No matching books found after filtering\n`);
-        const candidate = selection.bestCandidate;
-        const message = candidate
-          ? `No reliable match (best: "${candidate.title}", ${Math.round(selection.confidence * 100)}% confidence)`
-          : 'No matching edition found';
-        updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: candidate?.title || '', matched_author: candidate?.authors || '', match_confidence: String(Math.round(selection.confidence * 100)) });
-        options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message, matchTitle: candidate?.title, matchAuthors: candidate?.authors, confidence: selection.confidence });
-        failCount++;
-        continue;
-      }
+        if (books.length === 0) {
+          console.log(`  ❌ No results found\n`);
+          updateCSVResult(csvPath, i, { status: 'failed', error: 'No results found', matched_title: '', matched_author: '', match_confidence: '' }, rows);
+          options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message: 'No results found' });
+          failCount++;
+          continue;
+        }
 
-      updateCSVResult(csvPath, i, { status: 'matched', error: '', matched_title: selectedBook.title, matched_author: selectedBook.authors, match_confidence: String(Math.round(selection.confidence * 100)) });
-      // Matches above 80% download automatically. Lower reliable matches are
-      // deferred so the automatic matching pass can continue to the next row.
-      if (options.confirmMatch && selection.confidence <= 0.8) {
-        pendingReviews.push({ rowIndex: i, book: selectedBook, confidence: selection.confidence });
-        options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: 'Review deferred until automatic matches finish', format: selectedBook.format, size: selectedBook.size, matchTitle: selectedBook.title, matchAuthors: selectedBook.authors, confidence: selection.confidence });
-        continue;
+        // Filter and select best match
+        const selection = selectReliableBook(books, config, row.title, row.author);
+        const picked = selection.book;
+        if (!picked) {
+          console.log(`  ❌ No matching books found after filtering\n`);
+          const candidate = selection.bestCandidate;
+          const message = candidate
+            ? `No reliable match (best: "${candidate.title}", ${Math.round(selection.confidence * 100)}% confidence)`
+            : 'No matching edition found';
+          updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: candidate?.title || '', matched_author: candidate?.authors || '', match_confidence: String(Math.round(selection.confidence * 100)) }, rows);
+          options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message, matchTitle: candidate?.title, matchAuthors: candidate?.authors, confidence: selection.confidence });
+          failCount++;
+          continue;
+        }
+
+        updateCSVResult(csvPath, i, { status: 'matched', error: '', matched_title: picked.title, matched_author: picked.authors, match_confidence: String(Math.round(selection.confidence * 100)) }, rows);
+        // Matches above 80% download automatically. Lower reliable matches are
+        // deferred so the automatic matching pass can continue to the next row.
+        if (options.confirmMatch && selection.confidence <= 0.8) {
+          pendingReviews.push({ rowIndex: i, book: picked, confidence: selection.confidence });
+          options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: 'Review deferred until automatic matches finish', format: picked.format, size: picked.size, matchTitle: picked.title, matchAuthors: picked.authors, confidence: selection.confidence });
+          continue;
+        }
+        if (options.confirmMatch && selection.confidence > 0.8) {
+          options.onEvent?.({ rowIndex: i, status: 'searching', progress: 0, message: 'High-confidence match; downloading automatically', format: picked.format, size: picked.size, matchTitle: picked.title, matchAuthors: picked.authors, confidence: selection.confidence });
+        }
+        console.log(`  📚 Found: ${picked.format} (${picked.size})`);
+        selectedBook = picked;
       }
-      if (options.confirmMatch && selection.confidence > 0.8) {
-        options.onEvent?.({ rowIndex: i, status: 'searching', progress: 0, message: 'High-confidence match; downloading automatically', format: selectedBook.format, size: selectedBook.size, matchTitle: selectedBook.title, matchAuthors: selectedBook.authors, confidence: selection.confidence });
-      }
-      console.log(`  📚 Found: ${selectedBook.format} (${selectedBook.size})`);
 
       // Download the book
       options.onEvent?.({ rowIndex: i, status: 'downloading', progress: 0, format: selectedBook.format, size: selectedBook.size });
@@ -561,19 +680,19 @@ export async function processCSV(
 
       if (verifyDownload(filePath)) {
         console.log(`  ✅ Downloaded and verified successfully\n`);
-        updateCSVResult(csvPath, i, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' });
+        updateCSVResult(csvPath, i, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' }, rows);
         options.onEvent?.({ rowIndex: i, status: 'completed', progress: 100, format: selectedBook.format, size: selectedBook.size });
         successCount++;
       } else {
         console.log(`  ❌ Download verification failed\n`);
-        updateCSVResult(csvPath, i, { status: 'failed', error: 'Download verification failed' });
+        updateCSVResult(csvPath, i, { status: 'failed', error: 'Download verification failed' }, rows);
         options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message: 'Download verification failed' });
         failCount++;
       }
     } catch (error) {
       // Handle rate limiting
       if (error instanceof RateLimitError) {
-        updateCSVResult(csvPath, i, { status: 'Not started', error: error.message });
+        updateCSVResult(csvPath, i, { status: 'queued', error: error.message }, rows);
         options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: error.message });
         console.log(`\n${'='.repeat(50)}`);
         console.log(`⚠️  RATE LIMIT EXCEEDED (429)`);
@@ -593,7 +712,7 @@ export async function processCSV(
 
       console.log(`  ❌ Error: ${error}\n`);
       const message = error instanceof Error ? error.message : String(error);
-      updateCSVResult(csvPath, i, { status: 'failed', error: message });
+      updateCSVResult(csvPath, i, { status: 'failed', error: message }, rows);
       options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message });
       failCount++;
     }
@@ -612,7 +731,7 @@ export async function processCSV(
     const decision = await options.confirmMatch!(rowIndex, book, confidence);
     if (options.signal?.aborted) break;
     if (decision === 'skip') {
-      updateCSVResult(csvPath, rowIndex, { status: 'skipped', error: 'Skipped by user' });
+      updateCSVResult(csvPath, rowIndex, { status: 'skipped', error: 'Skipped by user' }, rows);
       options.onEvent?.({ rowIndex, status: 'skipped', progress: 0, message: 'Skipped by user', matchTitle: book.title, matchAuthors: book.authors, confidence });
       skippedCount++;
       continue;
@@ -626,18 +745,18 @@ export async function processCSV(
           options.onEvent?.({ rowIndex, status: 'downloading', progress, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence, message: transfer ? `${transfer.route} route · ${formatTransferSpeed(transfer.bytesPerSecond)}` : undefined });
         }, options.signal);
       if (!verifyDownload(filePath)) throw new Error('Download verification failed');
-      updateCSVResult(csvPath, rowIndex, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' });
+      updateCSVResult(csvPath, rowIndex, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' }, rows);
       options.onEvent?.({ rowIndex, status: 'completed', progress: 100, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence });
       successCount++;
     } catch (error) {
       if (options.signal?.aborted || axios.isCancel(error)) break;
       if (error instanceof RateLimitError) {
-        updateCSVResult(csvPath, rowIndex, { status: 'Not started', error: error.message });
+        updateCSVResult(csvPath, rowIndex, { status: 'queued', error: error.message }, rows);
         options.onEvent?.({ rowIndex, status: 'queued', progress: 0, message: error.message, matchTitle: book.title, matchAuthors: book.authors, confidence });
         throw error;
       }
       const message = error instanceof Error ? error.message : String(error);
-      updateCSVResult(csvPath, rowIndex, { status: 'failed', error: message });
+      updateCSVResult(csvPath, rowIndex, { status: 'failed', error: message }, rows);
       options.onEvent?.({ rowIndex, status: 'failed', progress: 0, message, matchTitle: book.title, matchAuthors: book.authors, confidence });
       failCount++;
     }
@@ -648,6 +767,128 @@ export async function processCSV(
   console.log(`  ❌ ${failCount} failed`);
   console.log(`  ⏭️  ${skippedCount} skipped`);
   console.log('='.repeat(50));
+}
+
+/**
+ * Search and rank editions for a single CSV row, without writing anything.
+ */
+export async function findRowCandidates(row: CSVRow, config: Config): Promise<MatchCandidate[]> {
+  const query = buildBookSearchQuery(row.author, row.title);
+  const books = await findBook(query);
+  const titleOnly = isPlaceholderAuthor(row.author);
+  return rankCandidates(books, config, row.title, row.author)
+    .filter((candidate) => candidate.titleScore >= 0.45 && candidate.confidence >= 0.45 && (titleOnly || candidate.authorScore >= 0.3))
+    .slice(0, 10);
+}
+
+/** Persist a chosen edition as the durable, download-ready match for a row. */
+export function applySelectedMatch(csvPath: string, rowIndex: number, candidate: MatchCandidate, rows?: CSVRow[]): void {
+  updateCSVResult(csvPath, rowIndex, {
+    status: 'matched',
+    error: '',
+    matched_title: candidate.book.title,
+    matched_author: candidate.book.authors,
+    match_confidence: String(Math.round(candidate.confidence * 100)),
+    selected_hash: candidate.book.hash,
+    selected_url: candidate.book.url,
+    selected_title: candidate.book.title,
+    selected_authors: candidate.book.authors,
+    selected_publisher: candidate.book.publisher,
+    selected_language: candidate.book.language,
+    selected_format: candidate.book.format,
+    selected_size: candidate.book.size,
+  }, rows);
+}
+
+/** Durably record that none of the reviewed candidates were acceptable for a row. */
+export function rejectRowMatch(csvPath: string, rowIndex: number, reason = 'No acceptable match found'): void {
+  updateCSVResult(csvPath, rowIndex, {
+    status: 'rejected',
+    error: reason,
+    selected_hash: '',
+    selected_url: '',
+    selected_title: '',
+    selected_authors: '',
+    selected_publisher: '',
+    selected_language: '',
+    selected_format: '',
+    selected_size: '',
+  });
+}
+
+export type MatchStatus = 'scanning' | 'matched' | 'needs_review' | 'rejected' | 'failed';
+
+export interface MatchEvent {
+  rowIndex: number;
+  status: MatchStatus;
+  message?: string;
+  candidates?: MatchCandidate[];
+  selected?: MatchCandidate;
+}
+
+export interface ScanOptions {
+  signal?: AbortSignal;
+  onEvent?: (event: MatchEvent) => void;
+}
+
+/**
+ * Search and rank every not-yet-decided CSV row, auto-accepting exact matches and
+ * leaving everything else for manual review via applySelectedMatch/rejectRowMatch.
+ * Does not download anything.
+ */
+export async function scanMatches(csvPath: string, config: Config, options: ScanOptions = {}): Promise<void> {
+  const rows = readCSV(csvPath);
+
+  for (let i = 0; i < rows.length; i++) {
+    if (options.signal?.aborted) break;
+    const row = rows[i];
+    const status = row.status?.trim().toLowerCase();
+    if (status === 'downloaded' || status === 'rejected' || status === 'matched') continue;
+
+    options.onEvent?.({ rowIndex: i, status: 'scanning' });
+
+    try {
+      const candidates = await findRowCandidates(row, config);
+
+      const top = candidates[0];
+      // With no preferred publisher configured, a scan behaves like a normal download run
+      // (anything above the standard 80% confidence auto-accepts). Once a preferred publisher
+      // is set, only a token-exact match auto-accepts, so everything else surfaces for review —
+      // giving the user a chance to notice and pick a preferred-publisher edition among the top 10.
+      const autoAccept = top && (top.isExactMatch || (!config.preferredPublisher?.trim() && top.confidence > 0.8));
+
+      if (candidates.length === 0) {
+        const message = 'No sufficiently close downloadable match found';
+        updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: '', matched_author: '', match_confidence: '' }, rows);
+        options.onEvent?.({ rowIndex: i, status: 'failed', message });
+      } else if (autoAccept) {
+        applySelectedMatch(csvPath, i, candidates[0], rows);
+        options.onEvent?.({ rowIndex: i, status: 'matched', candidates, selected: candidates[0] });
+      } else {
+        updateCSVResult(csvPath, i, {
+          status: 'pending_review',
+          error: '',
+          matched_title: candidates[0].book.title,
+          matched_author: candidates[0].book.authors,
+          match_confidence: String(Math.round(candidates[0].confidence * 100)),
+        }, rows);
+        options.onEvent?.({ rowIndex: i, status: 'needs_review', candidates });
+      }
+    } catch (error) {
+      if (options.signal?.aborted) break;
+      if (error instanceof RateLimitError || error instanceof SearchAccessError) {
+        options.onEvent?.({ rowIndex: i, status: 'failed', message: error.message });
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: '', matched_author: '', match_confidence: '' }, rows);
+      options.onEvent?.({ rowIndex: i, status: 'failed', message });
+    }
+
+    if (i < rows.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
 }
 
 /**
@@ -695,7 +936,10 @@ export function isPlaceholderAuthor(author: string): boolean {
 }
 
 export function buildBookSearchQuery(author: string, title: string): string {
-  return isPlaceholderAuthor(author) ? title.trim() : `${author.trim()} ${title.trim()}`.trim();
+  // The current catalog search treats an author-plus-title string as an overly
+  // narrow phrase and often returns no results. Search broadly by title, then
+  // let rankCandidates validate and score the author independently.
+  return title.trim();
 }
 
 export function parseFileSizeBytes(size: string): number {
@@ -735,13 +979,35 @@ export interface MatchSelection {
   bestCandidate: Book | null;
 }
 
-export function selectReliableBook(
+/** Editions from the configured preferred publisher rank slightly higher among otherwise-comparable candidates. */
+const PUBLISHER_PREFERENCE_BOOST = 0.05;
+
+export function isPreferredPublisher(publisher: string, preferredPublisher?: string): boolean {
+  const preference = preferredPublisher?.trim();
+  if (!preference) return false;
+  return publisher.toLowerCase().includes(preference.toLowerCase());
+}
+
+export interface MatchCandidate {
+  book: Book;
+  titleScore: number;
+  authorScore: number;
+  confidence: number;
+  /** Token-exact title match (and author match, unless the requested author is a placeholder like "Anonymous"). */
+  isExactMatch: boolean;
+}
+
+/**
+ * Rank all eligible editions for a requested title/author by relevance.
+ * Filters out formatless editions and, when possible, editions outside the preferred language.
+ * Sorting applies the preferred-publisher boost, but the returned `confidence` stays unboosted.
+ */
+export function rankCandidates(
   books: Book[],
   config: Config,
   expectedTitle: string,
-  expectedAuthor: string,
-  threshold = 0.62
-): MatchSelection {
+  expectedAuthor: string
+): MatchCandidate[] {
   const titleOnly = isPlaceholderAuthor(expectedAuthor);
   let filtered = [...books];
   if (config.preferredLanguage) {
@@ -751,17 +1017,31 @@ export function selectReliableBook(
   }
   filtered = filtered.filter((book) => book.format.trim());
 
-  const rankedByConfidence = filtered.map((book) => {
+  return filtered.map((book) => {
     const titleScore = textSimilarity(expectedTitle, book.title);
     const authorScore = titleOnly ? 0 : textSimilarity(expectedAuthor, book.authors);
     const confidence = titleOnly ? titleScore : (titleScore * 0.8) + (authorScore * 0.2);
-    return { book, titleScore, authorScore, confidence };
-  }).sort((left, right) => right.confidence - left.confidence || right.book.downloadCount - left.book.downloadCount);
-  const bestCandidate = rankedByConfidence[0];
+    const isExactMatch = titleScore >= 0.999 && (titleOnly || authorScore >= 0.999);
+    return { book, titleScore, authorScore, confidence, isExactMatch };
+  }).sort((left, right) => {
+    const leftRank = left.confidence + (isPreferredPublisher(left.book.publisher, config.preferredPublisher) ? PUBLISHER_PREFERENCE_BOOST : 0);
+    const rightRank = right.confidence + (isPreferredPublisher(right.book.publisher, config.preferredPublisher) ? PUBLISHER_PREFERENCE_BOOST : 0);
+    return rightRank - leftRank || right.book.downloadCount - left.book.downloadCount;
+  });
+}
+
+export function selectReliableBook(
+  books: Book[],
+  config: Config,
+  expectedTitle: string,
+  expectedAuthor: string,
+  threshold = 0.62
+): MatchSelection {
+  const ranked = rankCandidates(books, config, expectedTitle, expectedAuthor);
+  const bestCandidate = ranked[0];
   if (!bestCandidate) return { book: null, confidence: 0, titleScore: 0, authorScore: 0, bestCandidate: null };
 
-  const reliable = rankedByConfidence
-    .filter((candidate) => candidate.titleScore >= 0.6 && candidate.confidence >= threshold);
+  const reliable = ranked.filter((candidate) => candidate.titleScore >= 0.6 && candidate.confidence >= threshold);
   const selected = reliable[0];
   if (!selected) {
     return { book: null, confidence: bestCandidate.confidence, titleScore: bestCandidate.titleScore, authorScore: bestCandidate.authorScore, bestCandidate: bestCandidate.book };

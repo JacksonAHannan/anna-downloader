@@ -2,7 +2,7 @@
 
 ## 1. Product summary
 
-Anna Downloader is a local TypeScript application with a browser-based UI for building, reviewing, and processing CSV reading lists. It uses Google Books for catalogue discovery and metadata, searches `annas-archive.gl` for downloadable editions, chooses editions using title-and-author relevance, tracks each row throughout the run, and maintains an exportable catalogue of books that have been successfully acquired.
+Anna Downloader is a local TypeScript application with a browser-based UI for building, reviewing, and processing CSV reading lists. It uses Google Books for catalogue discovery and metadata, searches Anna's Archive for downloadable editions, chooses editions using title-and-author relevance, tracks each row throughout the run, and maintains an exportable catalogue of books that have been successfully acquired.
 
 The product should favor correctness and resumability over maximizing download volume. It must never mark a book as owned unless the exact file written by that attempt has been verified as non-empty and complete.
 
@@ -23,7 +23,7 @@ The program must let a user:
 ## 3. Operating assumptions and boundaries
 
 - The application runs locally. API keys and download credentials remain on the Node server and are never exposed to browser code.
-- Anna's Archive integration targets `https://annas-archive.gl`.
+- Anna's Archive integration searches `https://annas-archive.is` and uses the stable MD5 member-download API at `https://annas-archive.gl` by default. Both hosts are configurable.
 - The user is responsible for ensuring that downloads are lawful. Public-domain material such as *Pride and Prejudice* is the standard end-to-end test content.
 - Slow-download pages may require manual DDoS-Guard verification. The application must not claim that it can bypass or automate a manual challenge.
 - Browser security prevents the application from silently overwriting the originally selected local CSV. The application therefore maintains a working copy and provides an explicit updated-CSV export.
@@ -39,6 +39,7 @@ The application reads configuration from `.env`.
 | `OUTPUT_FOLDER` | No | Destination for verified book files. |
 | `PREFERRED_FORMAT` | No | Required edition format when set, normally `pdf`. |
 | `PREFERRED_LANGUAGE` | No | Preferred edition language, normally English. |
+| `PREFERRED_PUBLISHER` | No | Editions from a publisher whose name contains this text rank higher (§8.2). Also editable at runtime from the UI (§8.4); the UI value overrides `.env` for the running server. |
 | `MAX_DOWNLOADS` | No | Maximum successful downloads in one run. Failures do not consume this limit. |
 | `UI_PORT` | No | Local web-server port. |
 
@@ -76,6 +77,7 @@ The working catalogue may add these columns:
 | `matched_title` | Anna edition title selected or proposed. |
 | `matched_author` | Anna edition author metadata. |
 | `match_confidence` | Integer percentage from 0 to 100. |
+| `selected_hash`, `selected_url`, `selected_title`, `selected_authors`, `selected_publisher`, `selected_language`, `selected_format`, `selected_size` | A full snapshot of the exact edition chosen during preliminary match review (see §8.4). When `selected_hash` is present, the download phase downloads that edition directly instead of searching again. |
 
 ### 5.3 Status semantics
 
@@ -84,11 +86,12 @@ Status comparisons must ignore casing and surrounding whitespace.
 | Status | Meaning |
 |---|---|
 | blank / `Not started` | Eligible for processing. |
-| `matched` | A candidate was found but is not yet owned. |
-| `pending_review` | A lower-confidence match is deferred to the review phase. |
+| `matched` | A candidate was found but is not yet owned. Set either by the automatic download-time matcher, or durably by preliminary match review once a specific edition (`selected_hash`) has been chosen. |
+| `pending_review` | Preliminary match review found candidates but none was an exact match; awaiting a manual pick from the top 10. |
+| `rejected` | The user reviewed the candidates during preliminary match review and none were acceptable. Durable: skipped by both later scans and later download runs. |
 | `downloaded` | The exact downloaded file was verified; this row is owned and must be skipped on later runs. |
 | `failed` | Processing failed for a non-quota reason and may be retried. |
-| `skipped` | The user declined the proposed candidate; the book is not owned. |
+| `skipped` | The user declined the proposed candidate during a live download run; the book is not owned. |
 
 Only `downloaded` is an ownership assertion. UI labels such as “Completed” or “Skipped” must not be written as `downloaded` unless verification succeeded.
 
@@ -135,7 +138,7 @@ The UI must provide “Save updated CSV,” returning all original rows plus the
 
 ### 8.1 Search
 
-- Query `annas-archive.gl` using both requested author and title.
+- Query the configured Anna's Archive catalog by title, then validate and rank authors independently because the current search rejects many combined author-title queries.
 - Parse all available search results into a normalized edition model containing title, authors, language, format, size, URL/hash, publisher, and popularity when available.
 - If `PREFERRED_FORMAT` is set, use this order: preferred format under 50 MB, other formats under 50 MB, larger/unknown-size preferred-format editions, then larger/unknown-size other formats. A formatless result must never create an extensionless output file.
 - Apply the preferred language when matching eligible editions.
@@ -146,6 +149,8 @@ Matching must use both title and author evidence, with title weighted more heavi
 
 The system must reject thematically related but incorrect works. For example, a search for *Botswana in the Modern World-System* must not download a generic work about the modern world-system.
 
+When `PREFERRED_PUBLISHER` is configured (via `.env` or the UI), editions from a publisher whose name contains that text receive a small ranking boost so they sort higher among otherwise-comparable candidates. This is a soft preference, not a filter: non-matching editions remain eligible and can still outrank a preferred-publisher edition on relevance or popularity, and the boost never changes the reported match confidence, only candidate ordering. With no preferred publisher configured, ranking is unaffected by publisher.
+
 ### 8.3 Confidence policy
 
 - A match strictly greater than 90% downloads automatically.
@@ -155,6 +160,18 @@ The system must reject thematically related but incorrect works. For example, a 
 - Review candidates appear at the end of the visible queue after automatic candidates have been evaluated.
 - Confirm downloads the displayed edition. Skip declines it without marking the book as owned.
 - Candidate ranking should allow later eligible candidates to be considered when a better-ranked candidate is unusable.
+
+### 8.4 Preliminary match review
+
+Before running downloads, the user may scan the CSV to see and choose editions ahead of time, independent of the download-time confidence policy in §8.3:
+
+- Scanning searches and ranks up to 10 candidates per not-yet-decided row (skipping rows already `downloaded`, `rejected`, or `matched`).
+- A row whose best candidate is a token-exact title match (and author match, unless the requested author is a placeholder such as "Anonymous") is always selected automatically and marked `matched`.
+- When no `PREFERRED_PUBLISHER` is configured, a non-exact match above 80% confidence also auto-accepts, matching the §8.3 download-time policy — scanning behaves like a preview of a normal run. Once a preferred publisher is set, only exact matches auto-accept, so every other candidate surfaces for review and the user gets a chance to notice and choose a preferred-publisher edition.
+- Every row that doesn't auto-accept is marked `pending_review` with its top 10 candidates available for manual selection; nothing downloads until the user picks one.
+- Picking a candidate writes it as the row's durable, exact edition (`selected_*` columns, status `matched`). Declining all candidates marks the row `rejected`.
+- A later download run honors a row's `selected_hash` directly — it downloads that exact edition without re-searching or re-scoring, regardless of the §8.3 confidence thresholds.
+- Scanning and downloading are mutually exclusive: only one may run against the CSV at a time.
 
 ## 9. Download workflow
 

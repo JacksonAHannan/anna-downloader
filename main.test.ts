@@ -13,7 +13,6 @@ import {
   bookToString,
   bookToJSON,
   verifyDownload,
-  updateCSVStatus,
   updateCSVResult,
   selectReliableBook,
   textSimilarity,
@@ -22,6 +21,14 @@ import {
   parseFileSizeBytes,
   RateLimitError,
   Book,
+  rankCandidates,
+  findRowCandidates,
+  applySelectedMatch,
+  rejectRowMatch,
+  scanMatches,
+  processCSV,
+  MatchCandidate,
+  safeDownloadFilename,
 } from './main';
 
 // Create axios mock
@@ -39,7 +46,7 @@ describe('findBook', () => {
     );
 
     mockAxios
-      .onGet(/annas-archive\.gl\/search/)
+      .onGet(/annas-archive\.(?:gl|is)\/search/)
       .reply(200, htmlFixture);
 
     const books = await findBook('Carl Sagan Demon Haunted World');
@@ -64,7 +71,7 @@ describe('findBook', () => {
     );
 
     mockAxios
-      .onGet(/annas-archive\.gl\/search/)
+      .onGet(/annas-archive\.(?:gl|is)\/search/)
       .reply(200, htmlFixture);
 
     const books = await findBook('Carl Sagan Demon Haunted World');
@@ -91,7 +98,7 @@ describe('findBook', () => {
     `;
 
     mockAxios
-      .onGet(/annas-archive\.gl\/search/)
+      .onGet(/annas-archive\.(?:gl|is)\/search/)
       .reply(200, htmlWithoutDownloads);
 
     const books = await findBook('Test Book');
@@ -102,7 +109,7 @@ describe('findBook', () => {
 
   it('should handle empty search results', async () => {
     mockAxios
-      .onGet(/annas-archive\.gl\/search/)
+      .onGet(/annas-archive\.(?:gl|is)\/search/)
       .reply(200, '<html><body></body></html>');
 
     const books = await findBook('NonexistentBook12345');
@@ -112,10 +119,44 @@ describe('findBook', () => {
 
   it('should throw error on network failure', async () => {
     mockAxios
-      .onGet(/annas-archive\.gl\/search/)
+      .onGet(/annas-archive\.(?:gl|is)\/search/)
       .networkError();
 
-    await expect(findBook('test')).rejects.toThrow('Failed to find books');
+    await expect(findBook('test')).rejects.toThrow('Book search failed');
+  });
+
+  it('parses current /books/ catalog cards and derives the download MD5 from the cover', async () => {
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, `
+      <div class="bg-white rounded-lg shadow p-4 mb-4"><div>
+        <a href="https://annas-archive.is/books/123-emma"><img src="https://covers.example/70D266A23257C234DA3DC4879DC660AC.webp"></a>
+        <div><h3><a href="https://annas-archive.is/books/123-emma">Emma</a></h3>
+          <div>Austen, Jane · 2011 · EPUB · 435.1 KB · Books catalog</div>
+          <div>Publisher: Penguin Classics</div>
+        </div>
+      </div></div>`);
+    await expect(findBook('Jane Austen Emma')).resolves.toEqual([expect.objectContaining({
+      title: 'Emma', authors: 'Austen, Jane', publisher: 'Penguin Classics', format: 'EPUB', size: '435.1 KB',
+      hash: '70d266a23257c234da3dc4879dc660ac', url: 'https://annas-archive.gl/md5/70d266a23257c234da3dc4879dc660ac',
+    })]);
+  });
+
+  it('retries subtitle-heavy catalog searches with the base title', async () => {
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply((config) => config.url?.includes(encodeURIComponent('Advanced Topics'))
+      ? [200, '<html><body></body></html>']
+      : [200, `<div class="bg-white"><div><a href="https://annas-archive.is/books/1"><img src="https://covers/70D266A23257C234DA3DC4879DC660AC.webp"></a><div><h3><a href="https://annas-archive.is/books/1">Probabilistic Machine Learning</a></h3><div>Kevin P. Murphy · 2022 · PDF · 10 MB</div></div></div></div>`]);
+    const books = await findBook('Probabilistic Machine Learning: Advanced Topics');
+    expect(books).toHaveLength(1);
+    expect(mockAxios.history.get).toHaveLength(2);
+  });
+
+  it('distinguishes metadata-only catalog cards from an empty search', async () => {
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, `<div class="bg-white"><div><div><h3><a href="https://annas-archive.is/books/1">Metadata only</a></h3><div>An Author · 2020 · PDF · 1 MB</div></div></div></div>`);
+    await expect(findBook('Metadata only')).rejects.toThrow('catalog match found, but none exposes an MD5');
+  });
+
+  it('explains that a search 403 is browser verification, not the download quota', async () => {
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(403, '<title>DDoS-Guard</title>');
+    await expect(findBook('test')).rejects.toThrow('browser verification challenge');
   });
 });
 
@@ -431,6 +472,60 @@ describe('reliable match selection', () => {
   });
 });
 
+describe('rankCandidates and preferred-publisher boost', () => {
+  const config = { secretKey: 'test', outputFolder: './test', preferredPublisher: 'Penguin' };
+  const makeBook = (title: string, authors: string, publisher = ''): Book => ({
+    title, authors, language: 'English [en]', format: 'PDF', size: '1 MB',
+    publisher, url: '', hash: title, downloadCount: 0,
+  });
+
+  it('ranks a preferred-publisher edition above an equal-confidence other edition', () => {
+    const penguin = makeBook('Beowulf: An Epic Poem', 'Anonymous', 'Penguin Classics');
+    const other = makeBook('Beowulf: An Epic Poem', 'Anonymous', 'Random House');
+    const ranked = rankCandidates([other, penguin], config, 'Beowulf: An Epic Poem', 'Anonymous');
+    expect(ranked[0].book).toBe(penguin);
+    // The boost only affects ordering — reported confidence must stay identical for equal matches.
+    expect(ranked[0].confidence).toBe(ranked[1].confidence);
+  });
+
+  it('does not let the preference boost override a clearly better non-preferred match', () => {
+    const weakPenguin = makeBook('Greek Tragedy: A Literary History', 'Unknown', 'Penguin Classics');
+    const strongMatch = makeBook('The Complete Plays of Aeschylus', 'Aeschylus', 'Oxford University Press');
+    const ranked = rankCandidates([weakPenguin, strongMatch], config, 'The Complete Plays of Aeschylus', 'Aeschylus');
+    expect(ranked[0].book).toBe(strongMatch);
+  });
+
+  it('matches the preference case-insensitively anywhere in the publisher name', () => {
+    const penguin = makeBook('Emma', 'Jane Austen', 'penguin classics');
+    const other = makeBook('Emma', 'Jane Austen', 'Random House');
+    const ranked = rankCandidates([other, penguin], config, 'Emma', 'Jane Austen');
+    expect(ranked[0].book).toBe(penguin);
+  });
+
+  it('applies no boost at all when no preferred publisher is configured', () => {
+    const noPreferenceConfig = { secretKey: 'test', outputFolder: './test' };
+    const penguin = makeBook('Beowulf: An Epic Poem', 'Anonymous', 'Penguin Classics');
+    const other = makeBook('Beowulf: An Epic Poem', 'Anonymous', 'Random House');
+    other.downloadCount = 10; // give the non-Penguin edition the only tiebreaker signal
+    const ranked = rankCandidates([penguin, other], noPreferenceConfig, 'Beowulf: An Epic Poem', 'Anonymous');
+    expect(ranked[0].book).toBe(other);
+  });
+
+  it('flags isExactMatch only for a token-exact title and author', () => {
+    const exact = makeBook('Emma', 'Jane Austen');
+    const closeButNotExact = makeBook('Emma: A Novel', 'Jane Austen');
+    const [rankedExact, rankedClose] = rankCandidates([closeButNotExact, exact], config, 'Emma', 'Jane Austen');
+    expect(rankedExact.book).toBe(exact);
+    expect(rankedExact.isExactMatch).toBe(true);
+    expect(rankedClose.isExactMatch).toBe(false);
+  });
+
+  it('flags isExactMatch on title alone for placeholder authors', () => {
+    const [ranked] = rankCandidates([makeBook('Beowulf', 'Seamus Heaney')], config, 'Beowulf', 'Anonymous');
+    expect(ranked.isExactMatch).toBe(true);
+  });
+});
+
 describe('book search queries', () => {
   it.each(['Anonymous', 'Anonymous / Traditional Chinese', 'Buddhist Tradition', 'Vyasa / Traditional'])(
     'searches by title when the author is a placeholder: %s',
@@ -440,9 +535,9 @@ describe('book search queries', () => {
     }
   );
 
-  it('keeps a real author in the query', () => {
+  it('searches real-author books by title and leaves author validation to ranking', () => {
     expect(isPlaceholderAuthor('Jane Austen')).toBe(false);
-    expect(buildBookSearchQuery('Jane Austen', 'Emma')).toBe('Jane Austen Emma');
+    expect(buildBookSearchQuery('Jane Austen', 'Emma')).toBe('Emma');
   });
 });
 
@@ -462,13 +557,137 @@ describe('file-size parsing', () => {
 describe('persisted CSV diagnostics', () => {
   it('writes error and proposed-match details for later inspection', () => {
     const csvPath = path.join(__dirname, '__fixtures__', 'test-diagnostics-temp.csv');
-    fs.writeFileSync(csvPath, 'author,title\nJannis Mossmann,Botswana in the Modern World-System\n');
+    fs.writeFileSync(csvPath, 'author,title,notes\nJannis Mossmann,Botswana in the Modern World-System,keep me\n');
     try {
       updateCSVResult(csvPath, 0, { status: 'failed', error: 'No reliable match', matched_title: 'Wrong title', matched_author: 'Wrong author', match_confidence: '31' });
-      expect(readCSV(csvPath)[0]).toMatchObject({ status: 'failed', error: 'No reliable match', matched_title: 'Wrong title', match_confidence: '31' });
+      expect(readCSV(csvPath)[0]).toMatchObject({ status: 'failed', error: 'No reliable match', matched_title: 'Wrong title', match_confidence: '31', notes: 'keep me' });
     } finally {
       fs.unlinkSync(csvPath);
     }
+  });
+});
+
+describe('applySelectedMatch and rejectRowMatch', () => {
+  let csvPath: string;
+
+  beforeEach(() => {
+    csvPath = path.join(__dirname, '__fixtures__', 'test-match-selection-temp.csv');
+    fs.writeFileSync(csvPath, 'author,title\nJane Austen,Emma\n');
+  });
+
+  afterEach(() => {
+    fs.rmSync(csvPath, { force: true });
+  });
+
+  it('persists the exact chosen edition as durable, download-ready columns', () => {
+    const candidate: MatchCandidate = {
+      book: { title: 'Emma', authors: 'Jane Austen', publisher: 'Penguin Classics', language: 'English [en]', format: 'EPUB', size: '1.2 MB', url: 'https://annas-archive.gl/md5/emmahash', hash: 'emmahash', downloadCount: 4200 },
+      titleScore: 1, authorScore: 1, confidence: 1, isExactMatch: true,
+    };
+    applySelectedMatch(csvPath, 0, candidate);
+    const row = readCSV(csvPath)[0];
+    expect(row).toMatchObject({
+      status: 'matched', matched_title: 'Emma', matched_author: 'Jane Austen', match_confidence: '100',
+      selected_hash: 'emmahash', selected_url: 'https://annas-archive.gl/md5/emmahash',
+      selected_publisher: 'Penguin Classics', selected_format: 'EPUB', selected_size: '1.2 MB',
+    });
+  });
+
+  it('marks a row rejected and clears any selected edition', () => {
+    const candidate: MatchCandidate = {
+      book: { title: 'Emma', authors: 'Jane Austen', publisher: '', language: 'English [en]', format: 'EPUB', size: '1.2 MB', url: '', hash: 'emmahash', downloadCount: 0 },
+      titleScore: 1, authorScore: 1, confidence: 1, isExactMatch: true,
+    };
+    applySelectedMatch(csvPath, 0, candidate);
+    rejectRowMatch(csvPath, 0);
+    const row = readCSV(csvPath)[0];
+    expect(row.status).toBe('rejected');
+    expect(row.selected_hash).toBe('');
+  });
+});
+
+describe('scanMatches', () => {
+  let csvPath: string;
+
+  beforeEach(() => {
+    mockAxios.reset();
+    csvPath = path.join(__dirname, '__fixtures__', 'test-scan-temp.csv');
+  });
+
+  afterEach(() => {
+    fs.rmSync(csvPath, { force: true });
+  });
+
+  it('auto-accepts an exact match and marks the row matched', async () => {
+    fs.writeFileSync(csvPath, 'author,title\nCarl Sagan,The Demon Haunted World\n');
+    const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
+
+    const events: Array<{ rowIndex: number; status: string }> = [];
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test' }, {
+      onEvent: (event) => events.push({ rowIndex: event.rowIndex, status: event.status }),
+    });
+
+    const row = readCSV(csvPath)[0];
+    expect(row.status).toBe('matched');
+    expect(row.selected_hash).toBeTruthy();
+    expect(events.some((event) => event.status === 'matched')).toBe(true);
+  });
+
+  it('defers a non-exact match to pending_review with candidates for the user to pick from', async () => {
+    fs.writeFileSync(csvPath, 'author,title\nCarl Sagan,The Demon Haunted World: Science and Skepticism\n');
+    const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
+
+    let candidateCount = 0;
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', preferredPublisher: 'Penguin' }, {
+      onEvent: (event) => { if (event.status === 'needs_review') candidateCount = event.candidates?.length || 0; },
+    });
+
+    const row = readCSV(csvPath)[0];
+    expect(row.status).toBe('pending_review');
+    expect(row.selected_hash).toBeFalsy();
+    expect(candidateCount).toBeGreaterThan(0);
+  });
+
+  it('skips rows already downloaded, rejected, or matched', async () => {
+    fs.writeFileSync(csvPath, 'author,title,status\nA,B,downloaded\nC,D,rejected\nE,F,matched\n');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
+
+    const events: Array<{ rowIndex: number }> = [];
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test' }, { onEvent: (event) => events.push({ rowIndex: event.rowIndex }) });
+
+    expect(events).toHaveLength(0);
+    expect(mockAxios.history.get.filter((request) => request.url?.includes('/search')).length).toBe(0);
+  });
+
+  it('auto-accepts a high-confidence but non-exact match when no preferred publisher is configured', async () => {
+    // "Carl E. Sagan" vs the fixture's "Carl Sagan" scores ~93% confidence but is not a token-exact author match.
+    fs.writeFileSync(csvPath, 'author,title\nCarl E. Sagan,The Demon Haunted World\n');
+    const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
+
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test' }, {});
+
+    const row = readCSV(csvPath)[0];
+    expect(row.status).toBe('matched');
+    expect(row.selected_hash).toBeTruthy();
+  });
+
+  it('requires an exact match before auto-accepting once a preferred publisher is configured', async () => {
+    fs.writeFileSync(csvPath, 'author,title\nCarl E. Sagan,The Demon Haunted World\n');
+    const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
+
+    let candidateCount = 0;
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', preferredPublisher: 'Penguin' }, {
+      onEvent: (event) => { if (event.status === 'needs_review') candidateCount = event.candidates?.length || 0; },
+    });
+
+    const row = readCSV(csvPath)[0];
+    expect(row.status).toBe('pending_review');
+    expect(row.selected_hash).toBeFalsy();
+    expect(candidateCount).toBeGreaterThan(0);
   });
 });
 
@@ -668,7 +887,7 @@ describe('downloadBook', () => {
     // Mock the actual file download with a readable stream
     const { Readable } = require('stream');
     const mockStream = new Readable();
-    mockStream.push('mock file content');
+    mockStream.push('%PDF-1.7 mock file content');
     mockStream.push(null); // end of stream
 
     mockAxios
@@ -682,7 +901,7 @@ describe('downloadBook', () => {
       expect(mockAxios.history.get).toHaveLength(2);
 
       // Verify file was created
-      const expectedFile = path.join(tmpDir, 'Test Book.pdf');
+      const expectedFile = path.join(tmpDir, 'Test Book-testhash12.pdf');
       expect(downloadedPath).toBe(expectedFile);
       expect(fs.existsSync(expectedFile)).toBe(true);
     } finally {
@@ -853,7 +1072,7 @@ describe('verifyDownload', () => {
 
   it('should return true for a file that exists with content', () => {
     const filePath = path.join(tmpDir, 'test-file.pdf');
-    fs.writeFileSync(filePath, 'test content');
+    fs.writeFileSync(filePath, '%PDF-1.7 test content');
 
     const result = verifyDownload(filePath);
     expect(result).toBe(true);
@@ -874,6 +1093,12 @@ describe('verifyDownload', () => {
     expect(result).toBe(false);
   });
 
+  it('rejects a non-PDF payload saved with a PDF extension', () => {
+    const filePath = path.join(tmpDir, 'not-a-book.pdf');
+    fs.writeFileSync(filePath, '<html>gateway error</html>');
+    expect(verifyDownload(filePath)).toBe(false);
+  });
+
   it('should return false when file access fails', () => {
     // Use an invalid path that will cause an error
     const result = verifyDownload('/invalid/path/\0/file.pdf');
@@ -881,86 +1106,15 @@ describe('verifyDownload', () => {
   });
 });
 
-describe('updateCSVStatus', () => {
-  let tmpDir: string;
-  let testCsvPath: string;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-csv-'));
-    testCsvPath = path.join(tmpDir, 'test-books.csv');
-
-    // Create initial CSV without status
-    const initialContent = `author,title
-Carl Sagan,The Demon Haunted World
-Alfred Lansing,Endurance: Shackleton's Incredible Voyage
-Isaac Asimov,Foundation`;
-    fs.writeFileSync(testCsvPath, initialContent);
+describe('safeDownloadFilename', () => {
+  it('bounds UTF-8 names and includes a collision-resistant edition suffix', () => {
+    const filename = safeDownloadFilename('📚'.repeat(200), 'PDF', 'abcdef1234567890');
+    expect(Buffer.byteLength(filename, 'utf8')).toBeLessThanOrEqual(180);
+    expect(filename).toMatch(/-abcdef1234\.pdf$/);
   });
 
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it('should update status for a valid row index', () => {
-    updateCSVStatus(testCsvPath, 0, 'downloaded');
-
-    const rows = readCSV(testCsvPath);
-    expect(rows[0].status).toBe('downloaded');
-    // CSV parse returns empty string for undefined values, not undefined
-    expect(rows[1].status).toBe('');
-    expect(rows[2].status).toBe('');
-  });
-
-  it('should write CSV with status column correctly', () => {
-    updateCSVStatus(testCsvPath, 1, 'failed');
-
-    const fileContent = fs.readFileSync(testCsvPath, 'utf-8');
-    expect(fileContent).toContain('author,title,status');
-    expect(fileContent).toContain('Alfred Lansing,Endurance: Shackleton\'s Incredible Voyage,failed');
-  });
-
-  it('should update multiple rows sequentially', () => {
-    updateCSVStatus(testCsvPath, 0, 'downloaded');
-    updateCSVStatus(testCsvPath, 1, 'failed');
-    updateCSVStatus(testCsvPath, 2, 'downloaded');
-
-    const rows = readCSV(testCsvPath);
-    expect(rows[0].status).toBe('downloaded');
-    expect(rows[1].status).toBe('failed');
-    expect(rows[2].status).toBe('downloaded');
-  });
-
-  it('should handle invalid row index gracefully', () => {
-    // Should not throw, just do nothing
-    expect(() => {
-      updateCSVStatus(testCsvPath, 999, 'downloaded');
-    }).not.toThrow();
-
-    const rows = readCSV(testCsvPath);
-    expect(rows).toHaveLength(3);
-  });
-
-  it('should preserve existing data when updating status', () => {
-    updateCSVStatus(testCsvPath, 0, 'downloaded');
-
-    const rows = readCSV(testCsvPath);
-    expect(rows[0]).toMatchObject({
-      author: 'Carl Sagan',
-      title: 'The Demon Haunted World',
-      status: 'downloaded',
-    });
-  });
-
-  it('should handle CSV that already has status column', () => {
-    // First update to add status column
-    updateCSVStatus(testCsvPath, 0, 'downloaded');
-
-    // Update again - should preserve first status and update second
-    updateCSVStatus(testCsvPath, 1, 'failed');
-
-    const rows = readCSV(testCsvPath);
-    expect(rows[0].status).toBe('downloaded');
-    expect(rows[1].status).toBe('failed');
+  it('avoids Windows reserved device names', () => {
+    expect(safeDownloadFilename('CON', 'epub', 'abcdef')).toBe('_CON-abcdef.epub');
   });
 });
 
@@ -1005,7 +1159,7 @@ Book 5,Author 5`;
       };
 
       // All searches return empty results (will fail - no books found)
-      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -1038,7 +1192,7 @@ Isaac Asimov,Book 3,`;
       };
 
       // Mock searches - should only search for books without "downloaded" status
-      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -1068,7 +1222,7 @@ Carl Sagan,Book 1`;
       };
 
       // Mock empty search results (no books found)
-      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -1095,7 +1249,7 @@ Book 3,Author 3`;
       };
 
       // All searches return empty (will fail)
-      mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
+      mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
       const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
@@ -1112,7 +1266,7 @@ Book 3,Author 3`;
 
   it('starts processing at the requested zero-based index', async () => {
     fs.writeFileSync(testCsvPath, 'author,title\nAuthor 1,Book 1\nAuthor 2,Book 2\nAuthor 3,Book 3\n');
-    mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, '<html><body></body></html>');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
     const { processCSV } = await import('./main');
     await processCSV(testCsvPath, { secretKey: 'test-key', outputFolder: downloadDir }, { startIndex: 2 });
@@ -1121,5 +1275,29 @@ Book 3,Author 3`;
     expect(rows[0].status || '').toBe('');
     expect(rows[1].status || '').toBe('');
     expect(rows[2].status).toBe('failed');
+  });
+
+  it("downloads a row's pre-selected match directly, without searching", async () => {
+    fs.writeFileSync(testCsvPath, [
+      'author,title,status,selected_hash,selected_title,selected_authors,selected_format,selected_size,selected_url',
+      'Jane Austen,Emma,matched,emmahash,Emma,Jane Austen,pdf,1 MB,https://annas-archive.gl/md5/emmahash',
+    ].join('\n'));
+
+    mockAxios.onGet(/fast_download\.json/).reply(200, { download_url: 'https://example.com/emma.pdf' });
+    const { Readable } = require('stream');
+    const stream = new Readable();
+    stream.push('%PDF-1.7 mock file content');
+    stream.push(null);
+    mockAxios.onGet('https://example.com/emma.pdf').reply(200, stream, { 'content-type': 'application/pdf' });
+
+    // Uses the statically-imported processCSV (bound at file load) rather than a dynamic
+    // import — the `loadConfig` tests upstream call jest.resetModules(), which would otherwise
+    // cause a fresh './main' import to pull in a fresh 'axios' instance that this file's
+    // mockAxios (bound to the original 'axios' instance) can no longer intercept.
+    await processCSV(testCsvPath, { secretKey: 'test-key', outputFolder: downloadDir });
+
+    expect(mockAxios.history.get.some((request) => request.url?.includes('/search'))).toBe(false);
+    const rows = readCSV(testCsvPath);
+    expect(rows[0].status).toBe('downloaded');
   });
 });
