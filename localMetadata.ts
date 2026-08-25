@@ -122,7 +122,11 @@ function openDatabase(databasePath: string, readOnly = false): DatabaseSync {
   return new DatabaseSync(databasePath, { readOnly, timeout: 10_000 });
 }
 
-function initializeDatabase(database: DatabaseSync): void {
+function databaseHasTable(database: DatabaseSync, tableName: string): boolean {
+  return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName));
+}
+
+function initializeDatabase(database: DatabaseSync): boolean {
   database.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -145,18 +149,22 @@ function initializeDatabase(database: DatabaseSync): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS records_md5 ON records(md5);
     CREATE INDEX IF NOT EXISTS records_isbn13 ON records(isbn13) WHERE isbn13 <> '';
-    CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-      title,
-      author,
-      content = 'records',
-      content_rowid = 'id',
-      tokenize = 'unicode61 remove_diacritics 2'
-    );
+    CREATE TABLE IF NOT EXISTS record_search (
+      record_id INTEGER PRIMARY KEY,
+      title_key TEXT NOT NULL,
+      author_key TEXT NOT NULL,
+      FOREIGN KEY(record_id) REFERENCES records(id) ON DELETE CASCADE
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS record_search_title_key ON record_search(title_key);
     CREATE TABLE IF NOT EXISTS index_metadata (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     ) STRICT;
   `);
+  // Older indexes used FTS5. Keep them readable where the local SQLite build
+  // supports that module, while all newly built indexes use portable B-tree
+  // prefix keys that work in Node's SQLite builds on Windows, macOS, and Linux.
+  return databaseHasTable(database, 'records_fts');
 }
 
 function recordArguments(record: LocalMetadataRecord): Array<string | number> {
@@ -176,13 +184,14 @@ export async function buildLocalMetadataIndex(options: BuildIndexOptions): Promi
   fs.mkdirSync(path.dirname(options.databasePath), { recursive: true });
 
   const database = openDatabase(options.databasePath);
-  initializeDatabase(database);
+  const hasLegacyFts = initializeDatabase(database);
   const insert = database.prepare(`
     INSERT OR IGNORE INTO records (
       md5, title, author, publisher, language, extension, filesize, content_type,
       isbn13, has_aa_download, has_external_download, source_rank
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const insertSearch = database.prepare('INSERT OR IGNORE INTO record_search (record_id, title_key, author_key) VALUES (?, ?, ?)');
   const setMetadata = database.prepare('INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)');
   const batchSize = Math.max(100, options.batchSize ?? 5_000);
   const progressEvery = Math.max(batchSize, options.progressEvery ?? 50_000);
@@ -221,7 +230,14 @@ export async function buildLocalMetadataIndex(options: BuildIndexOptions): Promi
         try {
           const record = parseAnnaMetadataLine(line);
           if (!record) recordsSkipped += 1;
-          else recordsInserted += Number(insert.run(...recordArguments(record)).changes);
+          else {
+            const result = insert.run(...recordArguments(record));
+            const inserted = Number(result.changes);
+            recordsInserted += inserted;
+            if (inserted) {
+              insertSearch.run(result.lastInsertRowid, metadataTokens(record.title).join(' '), metadataTokens(record.author).join(' '));
+            }
+          }
         } catch {
           malformedRecords += 1;
         }
@@ -240,13 +256,14 @@ export async function buildLocalMetadataIndex(options: BuildIndexOptions): Promi
     database.exec('COMMIT');
     transactionOpen = false;
 
-    // Building FTS once after the bulk insert is substantially faster than maintaining it row by row.
-    database.exec("INSERT INTO records_fts(records_fts) VALUES('rebuild')");
+    // Existing FTS-based indexes remain appendable and need an explicit rebuild.
+    if (hasLegacyFts) database.exec("INSERT INTO records_fts(records_fts) VALUES('rebuild')");
     database.exec('ANALYZE');
     setMetadata.run('records', String(recordsInserted));
     setMetadata.run('built_at', new Date().toISOString());
     setMetadata.run('source_files', JSON.stringify(options.sourceFiles));
     setMetadata.run('complete', String(options.maxRecords === undefined && filesCompleted === options.sourceFiles.length));
+    setMetadata.run('search_backend', hasLegacyFts ? 'fts5' : 'prefix_v1');
   } finally {
     if (transactionOpen) {
       try { database.exec('ROLLBACK'); } catch { /* database may already have closed the transaction */ }
@@ -283,23 +300,46 @@ export function searchLocalMetadata(databasePath: string, title: string, author 
   const tokens = metadataTokens(title);
   if (!tokens.length) return [];
   const database = openDatabase(databasePath, true);
-  const query = database.prepare(`
-    SELECT r.md5, r.title, r.author, r.publisher, r.language, r.extension, r.filesize,
-           r.content_type, r.isbn13, r.has_aa_download, r.has_external_download,
-           r.source_rank, bm25(records_fts, 8.0, 2.0) AS fts_rank
-    FROM records_fts
-    JOIN records r ON r.id = records_fts.rowid
-    WHERE records_fts MATCH ?
-    ORDER BY fts_rank ASC, r.has_aa_download DESC, r.source_rank DESC
-    LIMIT ?
-  `);
   const rows = new Map<string, DatabaseCandidateRow>();
 
   try {
     const candidateLimit = Math.max(50, Math.min(500, limit * 25));
-    for (const operator of ['AND', 'OR'] as const) {
-      for (const row of query.all(ftsExpression(tokens, operator), candidateLimit) as unknown as DatabaseCandidateRow[]) rows.set(row.md5, row);
-      if (rows.size >= candidateLimit || operator === 'OR') break;
+    if (databaseHasTable(database, 'records_fts')) {
+      try {
+        const ftsQuery = database.prepare(`
+          SELECT r.md5, r.title, r.author, r.publisher, r.language, r.extension, r.filesize,
+                 r.content_type, r.isbn13, r.has_aa_download, r.has_external_download,
+                 r.source_rank, bm25(records_fts, 8.0, 2.0) AS fts_rank
+          FROM records_fts
+          JOIN records r ON r.id = records_fts.rowid
+          WHERE records_fts MATCH ?
+          ORDER BY fts_rank ASC, r.has_aa_download DESC, r.source_rank DESC
+          LIMIT ?
+        `);
+        for (const operator of ['AND', 'OR'] as const) {
+          for (const row of ftsQuery.all(ftsExpression(tokens, operator), candidateLimit) as unknown as DatabaseCandidateRow[]) rows.set(row.md5, row);
+          if (rows.size >= candidateLimit || operator === 'OR') break;
+        }
+      } catch (error) {
+        if (!(error instanceof Error) || !/no such module:\s*fts5/i.test(error.message)) throw error;
+      }
+    }
+
+    if (rows.size === 0 && databaseHasTable(database, 'record_search')) {
+      const prefixQuery = database.prepare(`
+        SELECT r.md5, r.title, r.author, r.publisher, r.language, r.extension, r.filesize,
+               r.content_type, r.isbn13, r.has_aa_download, r.has_external_download,
+               r.source_rank, 0 AS fts_rank
+        FROM record_search s
+        JOIN records r ON r.id = s.record_id
+        WHERE s.title_key >= ? AND s.title_key < ?
+        ORDER BY r.has_aa_download DESC, r.source_rank DESC
+        LIMIT ?
+      `);
+      for (let tokenCount = tokens.length; tokenCount >= 1 && rows.size < candidateLimit; tokenCount--) {
+        const prefix = tokens.slice(0, tokenCount).join(' ');
+        for (const row of prefixQuery.all(prefix, `${prefix}\uffff`, candidateLimit) as unknown as DatabaseCandidateRow[]) rows.set(row.md5, row);
+      }
     }
   } finally {
     database.close();

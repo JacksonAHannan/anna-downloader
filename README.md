@@ -16,7 +16,7 @@ A local TypeScript application for matching CSV reading lists to book metadata, 
 - **Existing-library reconciliation** - On CSV import, recursively checks a configured library folder for editions already on disk
 - **Row-based starts** - Begin a run at any 1-based CSV row without processing earlier entries
 - **Alternative matching** - Skips unsuitable search results and rotates to the next reliable edition
-- **Local metadata search** - Searches a compact SQLite FTS index built from Anna's metadata dump, avoiding automated catalog title queries
+- **Local metadata search** - Searches a compact, cross-platform SQLite index built from Anna's metadata dump, avoiding automated catalog title queries
 - **Contained web fallback** - Optionally extracts MD5 leads from an explicitly configured untrusted catalog without trusting it as a download origin
 - **Rate limit handling** - Handles 429 responses gracefully
 - **Download verification** - Validates file completeness and PDF/EPUB signatures
@@ -74,6 +74,8 @@ Then set the completed database in `.env` and restart the app:
 ```dotenv
 ANNA_METADATA_INDEX=./metadata/anna-metadata.sqlite
 ```
+
+Indexes built by versions before 1.0 used the platform-dependent SQLite FTS5 module. Rebuild an older index once with the current CLI before moving it to another operating system.
 
 For a bounded smoke test, add `--shard 0 --max-records 1000000`. You can benchmark any `author,title` CSV against an index without modifying the CSV:
 

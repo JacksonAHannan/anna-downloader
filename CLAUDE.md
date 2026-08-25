@@ -20,7 +20,7 @@ Node.js 22.13 or newer is required. Use synthetic fixtures in tests and never co
 ## Architecture
 
 - `main.ts`: CSV state, provider ordering, matching, download routing, and verification.
-- `localMetadata.ts`: metadata-dump ingestion and SQLite FTS search.
+- `localMetadata.ts`: metadata-dump ingestion and portable SQLite search indexing.
 - `anna.ts`: exact-origin configuration and trusted-download URL validation.
 - `server.ts`: loopback-only HTTP API, session state, folder selection, and SSE progress.
 - `library.ts`: conservative reconciliation against files already on disk.
