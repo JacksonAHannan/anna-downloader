@@ -2,10 +2,13 @@ import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import axios from 'axios';
 import MockAdapter from 'axios-mock-adapter';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import * as zlib from 'zlib';
 import {
   findBook,
   downloadBook,
+  parseFastDomainIndexes,
   extractMetaInformation,
   filterBooks,
   readCSV,
@@ -30,9 +33,25 @@ import {
   MatchCandidate,
   safeDownloadFilename,
 } from './main';
+import { ANNAS_CATALOG_BASE_URLS, ANNAS_DOWNLOAD_BASE_URLS } from './anna';
+import { buildLocalMetadataIndex } from './localMetadata';
 
 // Create axios mock
 const mockAxios = new MockAdapter(axios);
+
+async function createTestMetadataIndex(title: string, author: string): Promise<{ folder: string; database: string }> {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'anna-provider-order-'));
+  const source = path.join(folder, 'aarecords__0.json.gz');
+  const database = path.join(folder, 'index.sqlite');
+  const line = JSON.stringify({ _source: { id: 'md5:0123456789abcdef0123456789abcdef', search_only_fields: {
+    search_title: title, search_author: author, search_publisher: 'Test Press',
+    search_most_likely_language_code: ['en'], search_extension: 'epub', search_filesize: 123456,
+    search_content_type: 'book_nonfiction', search_access_types: ['aa_download'], search_score_base_rank: 42,
+  } } });
+  fs.writeFileSync(source, zlib.gzipSync(`${line}\n`));
+  await buildLocalMetadataIndex({ sourceFiles: [source], databasePath: database });
+  return { folder, database };
+}
 
 describe('findBook', () => {
   beforeEach(() => {
@@ -59,7 +78,7 @@ describe('findBook', () => {
       language: 'English [en]',
       format: 'PDF',
       size: '10 MB',
-      hash: 'abc123def456',
+      hash: 'abc123def456abc123def456abc123de',
       downloadCount: 5234,
     });
   });
@@ -88,7 +107,7 @@ describe('findBook', () => {
       <html>
       <body>
         <div>
-          <a href="/md5/test123" class="truncate text-xl font-bold">Test Book</a>
+          <a href="/md5/0123456789abcdef0123456789abcdef" class="truncate text-xl font-bold">Test Book</a>
           <div><a href="/search?q=Test%20Author">Test Author</a></div>
           <div><a href="/search?q=Test%20Pub">Test Pub</a></div>
           <div class="text-gray-800">English [en] · PDF · 5 MB</div>
@@ -158,6 +177,95 @@ describe('findBook', () => {
     mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(403, '<title>DDoS-Guard</title>');
     await expect(findBook('test')).rejects.toThrow('browser verification challenge');
   });
+
+  it('falls back to the next configured catalog origin after a blocked domain', async () => {
+    const fallback = 'https://annas-archive-fallback.example';
+    ANNAS_CATALOG_BASE_URLS.push(fallback);
+    try {
+      mockAxios.onGet(new RegExp(`${new URL(ANNAS_CATALOG_BASE_URLS[0]).hostname.replace(/\./g, '\\.')}\\/search`)).reply(403, '<title>DDoS-Guard</title>');
+      mockAxios.onGet(new RegExp(`${new URL(fallback).hostname.replace(/\./g, '\\.')}\\/search`)).reply(200, fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8'));
+
+      await expect(findBook('The Demon Haunted World')).resolves.toHaveLength(3);
+    } finally {
+      ANNAS_CATALOG_BASE_URLS.pop();
+    }
+  });
+
+  it('catalog parser rejects malformed hashes instead of arbitrary paths', async () => {
+    mockAxios.onGet(/annas-archive\.gl\/search/).reply(200, `
+      <div><a href="/md5/not-an-md5" class="truncate text-xl font-bold">Unsafe result</a>
+      <div class="text-gray-800">English [en] Â· PDF Â· 1 MB</div></div>`);
+    await expect(findBook('Unsafe result')).resolves.toEqual([]);
+  });
+
+  it('catalog client rejects redirects that leave the configured origin', async () => {
+    mockAxios.onGet(/untrusted\.example\/search/).reply(302, '', { location: 'https://credential-capture.example/search?q=test' });
+    await expect(findBook('test', new Set(), 0, 0, ['https://untrusted.example'], 'untrusted_catalog'))
+      .rejects.toThrow('leave its configured origin');
+    expect(mockAxios.history.get).toHaveLength(1);
+  });
+
+  it('catalog client omits credentials and application secrets', async () => {
+    mockAxios.onGet(/untrusted\.example\/search/).reply(200, '<html><body></body></html>');
+    await findBook('Jane Austen Emma', new Set(), 0, 0, ['https://untrusted.example'], 'untrusted_catalog');
+    const request = mockAxios.history.get[0];
+    expect(request.url).toContain('/search?q=Jane%20Austen%20Emma');
+    expect(request.headers?.Authorization).toBeUndefined();
+    expect(request.headers?.Cookie).toBeUndefined();
+    expect(request.headers?.Referer).toBeUndefined();
+  });
+
+  it('catalog mode limits untrusted row candidates to PDF/EPUB and labels them', async () => {
+    const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
+    mockAxios.onGet(/annas-archive\.is\/search/).reply(200, htmlFixture);
+    const candidates = await findRowCandidates(
+      { author: 'Carl Sagan', title: 'The Demon Haunted World' },
+      { secretKey: 'unused', outputFolder: '.', untrustedCatalogSearch: true }
+    );
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates.every((candidate) => ['pdf', 'epub'].includes(candidate.book.format.toLowerCase()))).toBe(true);
+    expect(candidates.every((candidate) => candidate.book.searchSource === 'untrusted_catalog')).toBe(true);
+  });
+
+  it('catalog search stays disabled without explicit opt-in', async () => {
+    await expect(findRowCandidates(
+      { author: 'Jane Austen', title: 'Emma' },
+      { secretKey: 'unused', outputFolder: '.' }
+    )).rejects.toThrow('No metadata search provider is enabled');
+    expect(mockAxios.history.get).toHaveLength(0);
+  });
+
+  it('uses a usable local metadata match without contacting an enabled fallback', async () => {
+    const { folder, database } = await createTestMetadataIndex('The Demon Haunted World', 'Carl Sagan');
+    mockAxios.onGet(/annas-archive\.is\/search/).reply(200, '<html><body></body></html>');
+    try {
+      const candidates = await findRowCandidates(
+        { author: 'Carl Sagan', title: 'The Demon Haunted World' },
+        { secretKey: 'unused', outputFolder: '.', metadataIndex: database, untrustedCatalogSearch: true }
+      );
+      expect(candidates[0]?.book.searchSource).toBe('local_metadata');
+      expect(mockAxios.history.get).toHaveLength(0);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  it('uses an enabled fallback only after local metadata has no usable match', async () => {
+    const { folder, database } = await createTestMetadataIndex('An Unrelated Quantum Mechanics Manual', 'Different Author');
+    const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
+    mockAxios.onGet(/annas-archive\.is\/search/).reply(200, htmlFixture);
+    try {
+      const candidates = await findRowCandidates(
+        { author: 'Carl Sagan', title: 'The Demon Haunted World' },
+        { secretKey: 'unused', outputFolder: '.', metadataIndex: database, untrustedCatalogSearch: true }
+      );
+      expect(candidates[0]?.book.searchSource).toBe('untrusted_catalog');
+      expect(mockAxios.history.get.some((request) => request.url?.includes('/search'))).toBe(true);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
 });
 
 describe('extractMetaInformation', () => {
@@ -316,42 +424,6 @@ describe('filterBooks', () => {
     expect(result?.downloadCount).toBe(8000);
   });
 
-  it('should filter by format preference', () => {
-    const config = {
-      secretKey: 'test',
-      outputFolder: './downloads',
-      preferredFormat: 'epub',
-    };
-
-    const result = filterBooks(mockBooks, config);
-    expect(result?.format).toBe('epub');
-  });
-
-  it('should filter by both language and format', () => {
-    const config = {
-      secretKey: 'test',
-      outputFolder: './downloads',
-      preferredLanguage: 'English',
-      preferredFormat: 'mobi',
-    };
-
-    const result = filterBooks(mockBooks, config);
-    expect(result?.language).toBe('English');
-    expect(result?.format).toBe('mobi');
-    expect(result?.downloadCount).toBe(3000);
-  });
-
-  it('ignores format preference when ranking by popularity', () => {
-    const booksWithMultipleFormats: Book[] = [
-      { title: 'PDF Book 1', authors: 'Author A', publisher: 'Pub A', language: 'English', format: 'pdf', size: '2 MB', url: 'http://example.com/a', hash: 'hashA', downloadCount: 1500 },
-      { title: 'PDF Book 2', authors: 'Author B', publisher: 'Pub B', language: 'English', format: 'pdf', size: '3 MB', url: 'http://example.com/b', hash: 'hashB', downloadCount: 7500 },
-      { title: 'EPUB Book', authors: 'Author C', publisher: 'Pub C', language: 'English', format: 'epub', size: '4 MB', url: 'http://example.com/c', hash: 'hashC', downloadCount: 9000 },
-    ];
-    const config = { secretKey: 'test', outputFolder: './downloads', preferredFormat: 'pdf' };
-
-    expect(filterBooks(booksWithMultipleFormats, config)?.title).toBe('EPUB Book');
-  });
-
   it('should return null for empty book list', () => {
     const config = {
       secretKey: 'test',
@@ -377,7 +449,7 @@ describe('filterBooks', () => {
 });
 
 describe('reliable match selection', () => {
-  const config = { secretKey: 'test', outputFolder: './test', preferredFormat: 'pdf', preferredLanguage: 'English' };
+  const config = { secretKey: 'test', outputFolder: './test', preferredLanguage: 'English' };
   const makeBook = (title: string, authors: string): Book => ({
     title, authors, language: 'English [en]', format: 'PDF', size: '1 MB',
     publisher: '', url: '', hash: title, downloadCount: 0,
@@ -618,20 +690,20 @@ describe('scanMatches', () => {
     fs.rmSync(csvPath, { force: true });
   });
 
-  it('auto-accepts an exact match and marks the row matched', async () => {
+  it('requires review even for an exact match from the untrusted catalog', async () => {
     fs.writeFileSync(csvPath, 'author,title\nCarl Sagan,The Demon Haunted World\n');
     const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
     mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
 
     const events: Array<{ rowIndex: number; status: string }> = [];
-    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test' }, {
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', untrustedCatalogSearch: true }, {
       onEvent: (event) => events.push({ rowIndex: event.rowIndex, status: event.status }),
     });
 
     const row = readCSV(csvPath)[0];
-    expect(row.status).toBe('matched');
-    expect(row.selected_hash).toBeTruthy();
-    expect(events.some((event) => event.status === 'matched')).toBe(true);
+    expect(row.status).toBe('pending_review');
+    expect(row.selected_hash).toBeFalsy();
+    expect(events.some((event) => event.status === 'needs_review')).toBe(true);
   });
 
   it('defers a non-exact match to pending_review with candidates for the user to pick from', async () => {
@@ -640,7 +712,7 @@ describe('scanMatches', () => {
     mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
 
     let candidateCount = 0;
-    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', preferredPublisher: 'Penguin' }, {
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', preferredPublisher: 'Penguin', untrustedCatalogSearch: true }, {
       onEvent: (event) => { if (event.status === 'needs_review') candidateCount = event.candidates?.length || 0; },
     });
 
@@ -661,17 +733,42 @@ describe('scanMatches', () => {
     expect(mockAxios.history.get.filter((request) => request.url?.includes('/search')).length).toBe(0);
   });
 
-  it('auto-accepts a high-confidence but non-exact match when no preferred publisher is configured', async () => {
+  it('resumes scanning at the requested row and preserves earlier failures', async () => {
+    fs.writeFileSync(csvPath, 'author,title,status,error\nA,B,failed,keep this result\nC,D,,\n');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
+
+    const events: Array<{ rowIndex: number }> = [];
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', untrustedCatalogSearch: true }, {
+      startIndex: 1,
+      onEvent: (event) => events.push({ rowIndex: event.rowIndex }),
+    });
+
+    const rows = readCSV(csvPath);
+    expect(rows[0]).toMatchObject({ status: 'failed', error: 'keep this result' });
+    expect(events.every((event) => event.rowIndex >= 1)).toBe(true);
+  });
+
+  it('does not rescan a durably selected edition after a failed download', async () => {
+    fs.writeFileSync(csvPath, 'author,title,status,selected_hash\nA,B,failed,alreadyselected\n');
+    mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
+
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test' });
+
+    expect(mockAxios.history.get.filter((request) => request.url?.includes('/search'))).toHaveLength(0);
+    expect(readCSV(csvPath)[0]).toMatchObject({ status: 'failed', selected_hash: 'alreadyselected' });
+  });
+
+  it('requires review for a high-confidence untrusted-catalog match', async () => {
     // "Carl E. Sagan" vs the fixture's "Carl Sagan" scores ~93% confidence but is not a token-exact author match.
     fs.writeFileSync(csvPath, 'author,title\nCarl E. Sagan,The Demon Haunted World\n');
     const htmlFixture = fs.readFileSync(path.join(__dirname, '__fixtures__', 'search-results.html'), 'utf-8');
     mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
 
-    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test' }, {});
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', untrustedCatalogSearch: true }, {});
 
     const row = readCSV(csvPath)[0];
-    expect(row.status).toBe('matched');
-    expect(row.selected_hash).toBeTruthy();
+    expect(row.status).toBe('pending_review');
+    expect(row.selected_hash).toBeFalsy();
   });
 
   it('requires an exact match before auto-accepting once a preferred publisher is configured', async () => {
@@ -680,7 +777,7 @@ describe('scanMatches', () => {
     mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, htmlFixture);
 
     let candidateCount = 0;
-    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', preferredPublisher: 'Penguin' }, {
+    await scanMatches(csvPath, { secretKey: 'test', outputFolder: './test', preferredPublisher: 'Penguin', untrustedCatalogSearch: true }, {
       onEvent: (event) => { if (event.status === 'needs_review') candidateCount = event.candidates?.length || 0; },
     });
 
@@ -692,6 +789,16 @@ describe('scanMatches', () => {
 });
 
 describe('readCSV', () => {
+  it('accepts a UTF-8 BOM before the author header', () => {
+    const csvPath = path.join(__dirname, '__fixtures__', 'test-bom-temp.csv');
+    fs.writeFileSync(csvPath, '\uFEFFauthor,title\nJane Jacobs,The Economy of Cities\n');
+    try {
+      expect(readCSV(csvPath)[0]).toMatchObject({ author: 'Jane Jacobs', title: 'The Economy of Cities' });
+    } finally {
+      fs.unlinkSync(csvPath);
+    }
+  });
+
   it('should parse CSV file correctly', () => {
     const csvPath = path.join(__dirname, '__fixtures__', 'test-books.csv');
     const rows = readCSV(csvPath);
@@ -742,6 +849,8 @@ describe('loadConfig', () => {
   beforeEach(() => {
     jest.resetModules();
     process.env = { ...originalEnv };
+    delete process.env.ANNA_METADATA_INDEX;
+    delete process.env.ENABLE_UNTRUSTED_CATALOG_SEARCH;
   });
 
   afterEach(() => {
@@ -751,7 +860,6 @@ describe('loadConfig', () => {
   it('should load configuration from environment variables', () => {
     process.env.ANNAS_SECRET_KEY = 'test-secret-key';
     process.env.OUTPUT_FOLDER = './test-downloads';
-    process.env.PREFERRED_FORMAT = 'pdf';
     process.env.PREFERRED_LANGUAGE = 'English';
     process.env.MAX_DOWNLOADS = '5';
 
@@ -760,7 +868,6 @@ describe('loadConfig', () => {
     expect(config).toEqual({
       secretKey: 'test-secret-key',
       outputFolder: './test-downloads',
-      preferredFormat: 'pdf',
       preferredLanguage: 'English',
       maxDownloads: 5,
     });
@@ -775,12 +882,33 @@ describe('loadConfig', () => {
     expect(config.outputFolder).toBe('./downloads');
   });
 
+  it('loads and resolves a configured local metadata index path', () => {
+    process.env.ANNAS_SECRET_KEY = 'test-secret-key';
+    process.env.ANNA_METADATA_INDEX = './metadata.sqlite';
+
+    expect(loadConfig().metadataIndex).toBe(path.resolve('./metadata.sqlite'));
+  });
+
+  it('only enables the untrusted catalog through an affirmative environment flag', () => {
+    process.env.ANNAS_SECRET_KEY = 'test-secret-key';
+    process.env.ENABLE_UNTRUSTED_CATALOG_SEARCH = 'true';
+    expect(loadConfig().untrustedCatalogSearch).toBe(true);
+    process.env.ENABLE_UNTRUSTED_CATALOG_SEARCH = 'false';
+    expect(loadConfig().untrustedCatalogSearch).toBeUndefined();
+  });
+
   it('should throw error when secret key is missing', () => {
     delete process.env.ANNAS_SECRET_KEY;
 
     expect(() => {
       loadConfig();
     }).toThrow('ANNAS_SECRET_KEY environment variable is required');
+  });
+
+  it('allows metadata-only scanning without a download secret', () => {
+    delete process.env.ANNAS_SECRET_KEY;
+    const config = loadConfig({ requireSecretKey: false });
+    expect(config.secretKey).toBe('');
   });
 
   it('should parse MAX_DOWNLOADS as integer', () => {
@@ -802,14 +930,10 @@ describe('loadConfig', () => {
     expect(config.maxDownloads).toBeUndefined();
   });
 
-  it('should handle invalid MAX_DOWNLOADS values', () => {
+  it('rejects invalid MAX_DOWNLOADS values instead of silently disabling the limit', () => {
     process.env.ANNAS_SECRET_KEY = 'test-secret-key';
     process.env.MAX_DOWNLOADS = 'invalid';
-
-    const config = loadConfig();
-
-    // parseInt returns NaN for invalid strings
-    expect(config.maxDownloads).toBeNaN();
+    expect(() => loadConfig()).toThrow('MAX_DOWNLOADS must be a positive integer');
   });
 });
 
@@ -882,7 +1006,7 @@ describe('downloadBook', () => {
     // Mock the fast download API response
     mockAxios
       .onGet(/fast_download\.json/)
-      .reply(200, { download_url: 'http://example.com/download/file.pdf' });
+      .reply(200, { download_url: 'https://example.com/download/file.pdf' });
 
     // Mock the actual file download with a readable stream
     const { Readable } = require('stream');
@@ -891,7 +1015,7 @@ describe('downloadBook', () => {
     mockStream.push(null); // end of stream
 
     mockAxios
-      .onGet('http://example.com/download/file.pdf')
+      .onGet('https://example.com/download/file.pdf')
       .reply(200, mockStream, { 'content-type': 'application/pdf' });
 
     const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-downloads-'));
@@ -960,9 +1084,8 @@ describe('downloadBook', () => {
       format: 'PDF', size: '0 B', url: '', hash: 'empty-hash', downloadCount: 0,
     };
     const { Readable } = require('stream');
-    const emptyStream = new Readable({ read() { this.push(null); } });
     mockAxios.onGet(/fast_download\.json/).reply(200, { download_url: 'https://example.com/empty.pdf' });
-    mockAxios.onGet('https://example.com/empty.pdf').reply(200, emptyStream, { 'content-length': '0' });
+    mockAxios.onGet('https://example.com/empty.pdf').reply(() => [200, Readable.from([]), { 'content-length': '0' }]);
     const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-empty-download-'));
     try {
       await expect(downloadBook(book, 'test-secret', tmpDir)).rejects.toThrow('Downloaded file is empty');
@@ -1032,6 +1155,7 @@ describe('downloadBook', () => {
         if (transfer) transfers.push(transfer.route);
       });
       expect(fastRequests).toBe(3);
+      expect(mockAxios.history.get.slice(0, 3).map((request) => request.params?.domain_index)).toEqual([6, 7, 1]);
       expect(mockAxios.history.get.some((request) => request.url === book.url)).toBe(false);
       expect(transfers).toContain('fast');
     } finally {
@@ -1056,6 +1180,59 @@ describe('downloadBook', () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it('rotates to a different signed mirror when the first server is unavailable', async () => {
+    const book: Book = {
+      title: 'Mirror Rotation Book', authors: 'Test Author', publisher: '', language: 'English',
+      format: 'PDF', size: '7 B', url: '', hash: 'rotation-hash', downloadCount: 0,
+    };
+    const { Readable } = require('stream');
+    mockAxios.onGet(/fast_download\.json/).reply((request) => [200, {
+      download_url: request.params?.domain_index === 6
+        ? 'https://unavailable.example/book.pdf'
+        : 'https://responsive.example/book.pdf',
+    }]);
+    mockAxios.onGet('https://unavailable.example/book.pdf').networkError();
+    mockAxios.onGet('https://responsive.example/book.pdf')
+      .reply(() => [200, Readable.from(['content']), { 'content-type': 'application/pdf', 'content-length': '7' }]);
+    const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-mirror-rotation-'));
+    try {
+      await expect(downloadBook(book, 'test-secret', tmpDir)).resolves.toContain('Mirror Rotation Book-rotationha.pdf');
+      const apiRequests = mockAxios.history.get.filter((request) => request.url?.includes('fast_download.json'));
+      expect(apiRequests.map((request) => request.params?.domain_index)).toEqual([6, 7]);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the next configured download origin', async () => {
+    const fallback = 'https://annas-download-fallback.example';
+    ANNAS_DOWNLOAD_BASE_URLS.push(fallback);
+    const book: Book = { title: 'Fallback Book', authors: 'Author', publisher: '', language: 'English', format: 'pdf', size: '1 MB', url: '', hash: 'fallbackhash', downloadCount: 0 };
+    const { Readable } = require('stream');
+    mockAxios.onGet(new RegExp(`${new URL(ANNAS_DOWNLOAD_BASE_URLS[0]).hostname.replace(/\./g, '\\.')}.*fast_download`)).networkError();
+    mockAxios.onGet(new RegExp(`${new URL(fallback).hostname.replace(/\./g, '\\.')}.*fast_download`)).reply(200, { download_url: 'https://files.example/fallback.pdf' });
+    mockAxios.onGet('https://files.example/fallback.pdf').reply(() => [200, Readable.from(['%PDF-1.7 fallback content']), { 'content-type': 'application/pdf' }]);
+    const tmpDir = fs.mkdtempSync(path.join(__dirname, 'test-download-fallback-'));
+    try {
+      await expect(downloadBook(book, 'test-secret', tmpDir)).resolves.toContain('Fallback Book-fallbackha.pdf');
+    } finally {
+      ANNAS_DOWNLOAD_BASE_URLS.pop();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+});
+
+describe('fast download server preferences', () => {
+  it('uses responsive fallback indexes when no override is configured', () => {
+    expect(parseFastDomainIndexes(undefined)).toEqual([6, 7, 1, 2, 8, 9, 0]);
+    expect(parseFastDomainIndexes('')).toEqual([6, 7, 1, 2, 8, 9, 0]);
+  });
+
+  it('normalizes configured indexes without duplicates or invalid values', () => {
+    expect(parseFastDomainIndexes('7, 6, 7, nope, -1, 101')).toEqual([7, 6]);
   });
 });
 
@@ -1156,12 +1333,12 @@ Book 5,Author 5`;
         secretKey: 'test-key',
         outputFolder: downloadDir,
         maxDownloads: 2,
+        untrustedCatalogSearch: true,
       };
 
       // All searches return empty results (will fail - no books found)
       mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
-      const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
 
       const rows = readCSV(testCsvPath);
@@ -1189,12 +1366,12 @@ Isaac Asimov,Book 3,`;
       const config = {
         secretKey: 'test-key',
         outputFolder: downloadDir,
+        untrustedCatalogSearch: true,
       };
 
       // Mock searches - should only search for books without "downloaded" status
       mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
-      const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
 
       const rows = readCSV(testCsvPath);
@@ -1219,12 +1396,12 @@ Carl Sagan,Book 1`;
       const config = {
         secretKey: 'test-key',
         outputFolder: downloadDir,
+        untrustedCatalogSearch: true,
       };
 
       // Mock empty search results (no books found)
       mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
-      const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
 
       const rows = readCSV(testCsvPath);
@@ -1246,12 +1423,12 @@ Book 3,Author 3`;
         secretKey: 'test-key',
         outputFolder: downloadDir,
         maxDownloads: 5, // Ensure limit doesn't interfere
+        untrustedCatalogSearch: true,
       };
 
       // All searches return empty (will fail)
       mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
-      const { processCSV } = await import('./main');
       await processCSV(testCsvPath, config);
 
       const rows = readCSV(testCsvPath);
@@ -1268,13 +1445,17 @@ Book 3,Author 3`;
     fs.writeFileSync(testCsvPath, 'author,title\nAuthor 1,Book 1\nAuthor 2,Book 2\nAuthor 3,Book 3\n');
     mockAxios.onGet(/annas-archive\.(?:gl|is)\/search/).reply(200, '<html><body></body></html>');
 
-    const { processCSV } = await import('./main');
-    await processCSV(testCsvPath, { secretKey: 'test-key', outputFolder: downloadDir }, { startIndex: 2 });
+    const events: Array<{ rowIndex: number }> = [];
+    await processCSV(testCsvPath, { secretKey: 'test-key', outputFolder: downloadDir, untrustedCatalogSearch: true }, {
+      startIndex: 2,
+      onEvent: (event) => events.push({ rowIndex: event.rowIndex }),
+    });
 
     const rows = readCSV(testCsvPath);
     expect(rows[0].status || '').toBe('');
     expect(rows[1].status || '').toBe('');
     expect(rows[2].status).toBe('failed');
+    expect(events.every((event) => event.rowIndex >= 2)).toBe(true);
   });
 
   it("downloads a row's pre-selected match directly, without searching", async () => {

@@ -2,7 +2,7 @@
 
 ## 1. Product summary
 
-Anna Downloader is a local TypeScript application with a browser-based UI for building, reviewing, and processing CSV reading lists. It uses Google Books for catalogue discovery and metadata, searches Anna's Archive for downloadable editions, chooses editions using title-and-author relevance, tracks each row throughout the run, and maintains an exportable catalogue of books that have been successfully acquired.
+Anna Downloader is a local TypeScript application with a browser-based UI for building, reviewing, and processing CSV reading lists. It can use configured LLM providers to generate reading lists, searches a local metadata index before any explicitly enabled fallback, chooses editions using title-and-author relevance, tracks each row throughout the run, and maintains an exportable catalogue of verified downloads.
 
 The product should favor correctness and resumability over maximizing download volume. It must never mark a book as owned unless the exact file written by that attempt has been verified as non-empty and complete.
 
@@ -10,7 +10,7 @@ The product should favor correctness and resumability over maximizing download v
 
 The program must let a user:
 
-1. Build CSV reading lists from Google Books searches.
+1. Build CSV reading lists from natural-language requests using a configured LLM provider.
 2. Import an existing CSV from the local computer.
 3. See which rows are already marked as downloaded and skip them automatically.
 4. Find the most relevant eligible Anna's Archive edition for each row.
@@ -23,7 +23,7 @@ The program must let a user:
 ## 3. Operating assumptions and boundaries
 
 - The application runs locally. API keys and download credentials remain on the Node server and are never exposed to browser code.
-- Anna's Archive integration searches `https://annas-archive.is` and uses the stable MD5 member-download API at `https://annas-archive.gl` by default. Both hosts are configurable.
+- Edition matching searches a configured local SQLite metadata index first. An unaffiliated HTML catalog may be enabled explicitly as a search-only fallback when local metadata has no usable match; it is never trusted as a download origin.
 - The user is responsible for ensuring that downloads are lawful. Public-domain material such as *Pride and Prejudice* is the standard end-to-end test content.
 - Slow-download pages may require manual DDoS-Guard verification. The application must not claim that it can bypass or automate a manual challenge.
 - Browser security prevents the application from silently overwriting the originally selected local CSV. The application therefore maintains a working copy and provides an explicit updated-CSV export.
@@ -35,9 +35,11 @@ The application reads configuration from `.env`.
 | Variable | Required | Purpose |
 |---|---:|---|
 | `ANNAS_SECRET_KEY` | Yes for fast downloads | Authenticates Anna's Archive fast-download requests. |
-| `GOOGLE_BOOKS_KEY` | Yes for list building | Authenticates Google Books API searches. |
+| `ANNA_METADATA_INDEX` | Recommended | Local SQLite metadata index queried before every enabled fallback. |
+| `ENABLE_UNTRUSTED_CATALOG_SEARCH` | No | Explicitly enables the search-only untrusted fallback. |
+| `UNTRUSTED_CATALOG_BASE_URL(S)` | No | Exact HTTPS origin(s) used only by the untrusted search client. |
+| Provider API keys | For list building | One or more supported LLM provider credentials; keys remain server-side. |
 | `OUTPUT_FOLDER` | No | Destination for verified book files. |
-| `PREFERRED_FORMAT` | No | Required edition format when set, normally `pdf`. |
 | `PREFERRED_LANGUAGE` | No | Preferred edition language, normally English. |
 | `PREFERRED_PUBLISHER` | No | Editions from a publisher whose name contains this text rank higher (§8.2). Also editable at runtime from the UI (§8.4); the UI value overrides `.env` for the running server. |
 | `MAX_DOWNLOADS` | No | Maximum successful downloads in one run. Failures do not consume this limit. |
@@ -77,7 +79,7 @@ The working catalogue may add these columns:
 | `matched_title` | Anna edition title selected or proposed. |
 | `matched_author` | Anna edition author metadata. |
 | `match_confidence` | Integer percentage from 0 to 100. |
-| `selected_hash`, `selected_url`, `selected_title`, `selected_authors`, `selected_publisher`, `selected_language`, `selected_format`, `selected_size` | A full snapshot of the exact edition chosen during preliminary match review (see §8.4). When `selected_hash` is present, the download phase downloads that edition directly instead of searching again. |
+| `selected_hash`, `selected_url`, `selected_title`, `selected_authors`, `selected_publisher`, `selected_language`, `selected_format`, `selected_size`, `selected_source` | A full snapshot of the exact edition and provenance chosen during preliminary match review (see §8.4). When `selected_hash` is present, the download phase downloads that edition directly instead of searching again. |
 
 ### 5.3 Status semantics
 
@@ -95,29 +97,25 @@ Status comparisons must ignore casing and surrounding whitespace.
 
 Only `downloaded` is an ownership assertion. UI labels such as “Completed” or “Skipped” must not be written as `downloaded` unless verification succeeded.
 
-## 6. Google Books list builder
+## 6. LLM book-list builder
 
-The UI must provide a “Build a book list” workspace backed by the Google Books API.
+The UI provides a “Build a book list” workspace backed by any configured supported LLM provider.
 
-### Required search modes
+### Request behavior
 
-- Any keyword
-- Topic or genre (`subject`)
-- Author
-- Title
-- Publisher
-- ISBN
+- Accept a natural-language description and a requested count between 1 and 100.
+- Let the user choose a configured provider and optionally override its model.
+- Request structured `author,title,description` output and validate it server-side.
+- Remove duplicate titles and exclude titles already returned during “generate more” requests.
+- Never expose provider API keys to the browser, logs, CSV output, or error messages.
 
 ### Result behavior
 
-- Display title, all authors, publication date, publisher, categories, description, and cover when available.
-- Allow selection of individual results.
-- Provide “Select all” for all currently loaded results.
-- Support configurable page size and loading additional results.
+- Display title, author, and the generated reason for inclusion.
+- Allow selection of individual results and “Select all.”
 - Export selected results as an `author,title` CSV.
 - Allow selected results to be sent directly to the downloader.
-- Join multiple Google Books authors using `; `.
-- Handle non-JSON upstream responses without exposing `Unexpected token '<'` to the user; show a meaningful API/server error instead.
+- Handle malformed or non-JSON provider responses with a meaningful server error.
 
 ## 7. CSV import and catalogue behavior
 
@@ -138,9 +136,12 @@ The UI must provide “Save updated CSV,” returning all original rows plus the
 
 ### 8.1 Search
 
-- Query the configured Anna's Archive catalog by title, then validate and rank authors independently because the current search rejects many combined author-title queries.
-- Parse all available search results into a normalized edition model containing title, authors, language, format, size, URL/hash, publisher, and popularity when available.
-- If `PREFERRED_FORMAT` is set, use this order: preferred format under 50 MB, other formats under 50 MB, larger/unknown-size preferred-format editions, then larger/unknown-size other formats. A formatless result must never create an extensionless output file.
+- Query the configured local SQLite metadata index by title first, then validate and rank authors independently.
+- If and only if local metadata has no candidate meeting the normal matching threshold, query an explicitly enabled fallback by title.
+- A missing or corrupt local database is an error and must not silently trigger the network fallback.
+- Parse available results into a normalized edition model containing title, authors, language, format, size, URL/hash, publisher, provenance, and popularity when available.
+- The untrusted fallback sends no credentials or referrer, accepts only same-origin redirects and bounded HTML responses, extracts only strict MD5 values, and may return PDF/EPUB candidates only.
+- A formatless result must never create an extensionless output file. Untrusted fallback results are restricted to PDF and EPUB.
 - Apply the preferred language when matching eligible editions.
 
 ### 8.2 Relevance scoring
@@ -153,8 +154,9 @@ When `PREFERRED_PUBLISHER` is configured (via `.env` or the UI), editions from a
 
 ### 8.3 Confidence policy
 
-- A match strictly greater than 90% downloads automatically.
-- A match at or below 90% that still meets the minimum reliable-match threshold is deferred for review.
+- A trusted local match strictly greater than 80% downloads automatically when no preferred publisher is configured.
+- A lower-confidence match that still meets the minimum reliable-match threshold is deferred for review.
+- Every untrusted-fallback match is deferred for explicit review regardless of confidence or exactness.
 - Unreliable matches are marked `failed` with `No reliable match`, including the best proposed title, author, and confidence when available.
 - The application must continue evaluating later CSV rows while review candidates accumulate.
 - Review candidates appear at the end of the visible queue after automatic candidates have been evaluated.
@@ -166,8 +168,9 @@ When `PREFERRED_PUBLISHER` is configured (via `.env` or the UI), editions from a
 Before running downloads, the user may scan the CSV to see and choose editions ahead of time, independent of the download-time confidence policy in §8.3:
 
 - Scanning searches and ranks up to 10 candidates per not-yet-decided row (skipping rows already `downloaded`, `rejected`, or `matched`).
-- A row whose best candidate is a token-exact title match (and author match, unless the requested author is a placeholder such as "Anonymous") is always selected automatically and marked `matched`.
-- When no `PREFERRED_PUBLISHER` is configured, a non-exact match above 80% confidence also auto-accepts, matching the §8.3 download-time policy — scanning behaves like a preview of a normal run. Once a preferred publisher is set, only exact matches auto-accept, so every other candidate surfaces for review and the user gets a chance to notice and choose a preferred-publisher edition.
+- A trusted local row whose best candidate is a token-exact title match (and author match, unless the requested author is a placeholder such as "Anonymous") is selected automatically and marked `matched`.
+- When no `PREFERRED_PUBLISHER` is configured, a trusted local non-exact match above 80% confidence also auto-accepts. Once a preferred publisher is set, only exact local matches auto-accept.
+- Untrusted-fallback candidates never auto-accept and always surface for manual review with a visible source label.
 - Every row that doesn't auto-accept is marked `pending_review` with its top 10 candidates available for manual selection; nothing downloads until the user picks one.
 - Picking a candidate writes it as the row's durable, exact edition (`selected_*` columns, status `matched`). Declining all candidates marks the row `rejected`.
 - A later download run honors a row's `selected_hash` directly — it downloads that exact edition without re-searching or re-scoring, regardless of the §8.3 confidence thresholds.
@@ -278,16 +281,16 @@ The product is acceptable when all of the following are demonstrably true:
 1. Importing a CSV containing `downloaded`, `Downloaded`, or whitespace-padded equivalents skips those rows without an Anna search.
 2. A verified download immediately writes `downloaded` to the runtime catalogue.
 3. “Save updated CSV” exports every input row and its latest status.
-4. A greater-than-90% match downloads without confirmation.
-5. A 90% match is deferred, not auto-downloaded.
+4. A trusted local match above 80% can proceed automatically when no publisher preference is configured.
+5. Every untrusted-fallback match is deferred for explicit review.
 6. Deferred reviews occur only after automatic candidates have been evaluated.
 7. A weak thematic match is not downloaded.
-8. A formatless candidate is rejected when PDF is required.
+8. A formatless candidate is rejected before download.
 9. A zero-byte, truncated, or HTML response is never marked downloaded.
 10. Local DNS failure can retry a resolvable fast mirror through public DNS.
 11. HTTP 429 pauses the run and leaves unfinished rows resumable.
 12. Existing verified files and catalogue statuses survive a restart.
-13. Google Books search supports all specified query modes, selection, Select All, CSV export, and direct use in the downloader.
+13. The LLM list builder validates structured results, supports selection and CSV export, and never exposes provider keys to the browser.
 14. The browser UI produces no relevant console errors during import, review, export, stop, or normal completion flows.
 15. *Pride and Prejudice* can be used as the public-domain end-to-end test without relying on copyrighted test material.
 

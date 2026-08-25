@@ -7,12 +7,10 @@ import { pipeline } from 'stream/promises';
 import * as https from 'https';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
+import { ANNAS_CATALOG_BASE_URLS, ANNAS_DOWNLOAD_BASE_URLS, UNTRUSTED_CATALOG_BASE_URLS, isTrustedAnnaURL } from './anna';
+import { searchLocalMetadata } from './localMetadata';
 
 // Constants
-const ANNAS_BASE_URL = (process.env.ANNAS_BASE_URL || 'https://annas-archive.is').replace(/\/$/, '');
-const ANNAS_DOWNLOAD_BASE_URL = (process.env.ANNAS_DOWNLOAD_BASE_URL || 'https://annas-archive.gl').replace(/\/$/, '');
-const ANNAS_SEARCH_ENDPOINT = `${ANNAS_BASE_URL}/search?q=`;
-const ANNAS_DOWNLOAD_ENDPOINT = `${ANNAS_DOWNLOAD_BASE_URL}/dyn/api/fast_download.json`;
 
 function optionsAbort(error: unknown, signal?: AbortSignal): boolean {
   return Boolean(signal?.aborted || axios.isCancel(error));
@@ -29,6 +27,10 @@ export interface Book {
   url: string;
   hash: string;
   downloadCount: number;
+  /** Internal Anna metadata relevance rank; unlike downloadCount, this is never shown as a usage statistic. */
+  sourceRank?: number;
+  /** Provenance is carried into review and CSV state; it never grants network trust. */
+  searchSource?: 'local_metadata' | 'untrusted_catalog' | 'catalog' | 'preselected';
 }
 
 interface FastDownloadResponse {
@@ -55,6 +57,7 @@ export interface CSVRow {
   selected_language?: string;
   selected_format?: string;
   selected_size?: string;
+  selected_source?: string;
 }
 
 export interface TransferInfo {
@@ -62,12 +65,27 @@ export interface TransferInfo {
   bytesPerSecond: number;
 }
 
-const FAST_DOWNLOAD_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 20_000;
+const MAX_CATALOG_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_CATALOG_REDIRECTS = 2;
+const FILE_REQUEST_TIMEOUT_MS = 45_000;
 const STALL_TIMEOUT_MS = 30_000;
 const SPEED_CHECK_AFTER_MS = 30_000;
 const MIN_TRANSFER_BYTES_PER_SECOND = 32 * 1024;
 const MAX_DOWNLOAD_BASENAME_BYTES = 180;
+
+export function parseFastDomainIndexes(value: string | undefined): number[] {
+  const configured = String(value || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter((entry) => Number.isInteger(entry) && entry >= 0 && entry <= 100);
+  const indexes = configured.length ? configured : [6, 7, 1, 2, 8, 9, 0];
+  return [...new Set(indexes)];
+}
+
+const FAST_DOWNLOAD_DOMAIN_INDEXES = parseFastDomainIndexes(process.env.ANNAS_FAST_DOMAIN_INDEXES);
 
 function formatTransferSpeed(bytesPerSecond: number): string {
   if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
@@ -88,10 +106,13 @@ export function safeDownloadFilename(title: string, extension: string, hash: str
 export interface Config {
   secretKey: string;
   outputFolder: string;
-  preferredFormat?: string;
   preferredLanguage?: string;
   /** Editions from a publisher whose name contains this text rank slightly higher. See rankCandidates. */
   preferredPublisher?: string;
+  /** SQLite FTS index built from the downloaded Anna metadata dump. */
+  metadataIndex?: string;
+  /** Explicit operator consent to query a third-party, untrusted HTML catalog. */
+  untrustedCatalogSearch?: boolean;
   maxDownloads?: number;
 }
 
@@ -122,6 +143,13 @@ export class CatalogMetadataError extends Error {
   }
 }
 
+export class SearchProviderConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SearchProviderConfigurationError';
+  }
+}
+
 /**
  * Extract metadata information from meta string
  */
@@ -143,22 +171,64 @@ export function extractMetaInformation(meta: string): {
   };
 }
 
+type SearchSource = NonNullable<Book['searchSource']>;
+
+async function requestCatalogPage(fullURL: string, catalogBaseURL: string): Promise<string> {
+  const allowedOrigin = new URL(catalogBaseURL).origin;
+  let currentURL = new URL(fullURL);
+
+  for (let redirectCount = 0; redirectCount <= MAX_CATALOG_REDIRECTS; redirectCount++) {
+    if (currentURL.origin !== allowedOrigin || currentURL.username || currentURL.password) {
+      throw new SearchAccessError('The catalog attempted to leave its configured origin. The response was rejected.');
+    }
+    const response = await axios.get<string>(currentURL.toString(), {
+      headers: {
+        // Intentionally omit Authorization, Cookie, Referer, and application secrets.
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+      timeout: REQUEST_TIMEOUT_MS,
+      responseType: 'text',
+      maxRedirects: 0,
+      maxContentLength: MAX_CATALOG_RESPONSE_BYTES,
+      maxBodyLength: MAX_CATALOG_RESPONSE_BYTES,
+      validateStatus: (status) => (status >= 200 && status < 300) || (status >= 300 && status < 400),
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.location;
+      if (!location) throw new SearchAccessError('The catalog returned a redirect without a destination.');
+      if (redirectCount === MAX_CATALOG_REDIRECTS) throw new SearchAccessError('The catalog exceeded the redirect limit.');
+      currentURL = new URL(location, currentURL);
+      continue;
+    }
+    const contentType = String(response.headers['content-type'] || '').toLowerCase();
+    if (contentType && !contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+      throw new SearchAccessError(`The catalog returned an unexpected response type (${contentType}).`);
+    }
+    return response.data;
+  }
+  throw new SearchAccessError('The catalog exceeded the redirect limit.');
+}
+
 /**
  * Find books by search query
  */
-export async function findBook(query: string, attemptedQueries = new Set<string>(), catalogMatchesFound = 0): Promise<Book[]> {
+export async function findBook(
+  query: string,
+  attemptedQueries = new Set<string>(),
+  catalogMatchesFound = 0,
+  catalogIndex = 0,
+  catalogBaseURLs: string[] = ANNAS_CATALOG_BASE_URLS,
+  searchSource: SearchSource = 'catalog'
+): Promise<Book[]> {
   attemptedQueries.add(query.toLowerCase());
   const encodedQuery = encodeURIComponent(query);
-  const fullURL = `${ANNAS_SEARCH_ENDPOINT}${encodedQuery}`;
+  const catalogBaseURL = catalogBaseURLs[catalogIndex];
+  const fullURL = `${catalogBaseURL}/search?q=${encodedQuery}`;
 
   try {
-    const response = await axios.get(fullURL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      },
-    });
-
-    const $ = cheerio.load(response.data);
+    const html = await requestCatalogPage(fullURL, catalogBaseURL);
+    const $ = cheerio.load(html);
     const bookList: Book[] = [];
 
     $('a[href^="/md5/"]').each((_, element) => {
@@ -197,7 +267,8 @@ export async function findBook(query: string, attemptedQueries = new Set<string>
       const { language, format, size } = extractMetaInformation(meta);
 
       const link = $el.attr('href') || '';
-      const hash = link.replace('/md5/', '');
+      const hash = link.match(/^\/md5\/([a-f0-9]{32})(?:[/?#]|$)/i)?.[1]?.toLowerCase() || '';
+      if (!hash) return;
 
       const book: Book = {
         language: language.trim(),
@@ -206,9 +277,12 @@ export async function findBook(query: string, attemptedQueries = new Set<string>
         title: title.trim(),
         publisher: publisher.trim(),
         authors: authors.trim(),
-        url: new URL(link, fullURL).href,
+        // Canonicalize edition links onto the configured download origin so a
+        // catalog redirect/domain change cannot leave a stale untrusted URL in CSV.
+        url: `${ANNAS_DOWNLOAD_BASE_URLS[0]}/md5/${hash}`,
         hash: hash,
         downloadCount: downloadCount,
+        searchSource,
       };
 
       bookList.push(book);
@@ -232,7 +306,8 @@ export async function findBook(query: string, attemptedQueries = new Set<string>
         bookList.push({
           title: $titleLink.text().trim(), authors: details[0] || '', publisher: publisherText.replace(/^Publisher:\s*/i, ''),
           language: '', format, size, hash, downloadCount: 0,
-          url: `${ANNAS_DOWNLOAD_BASE_URL}/md5/${hash}`,
+          url: `${ANNAS_DOWNLOAD_BASE_URLS[0]}/md5/${hash}`,
+          searchSource,
         });
       });
     }
@@ -245,7 +320,7 @@ export async function findBook(query: string, attemptedQueries = new Set<string>
       const fallbacks = [withoutSubtitle, withoutVolume, withoutAccents];
       for (let length = Math.min(3, meaningfulWords.length - 1); length >= 2; length--) fallbacks.push(meaningfulWords.slice(0, length).join(' '));
       const fallbackQuery = fallbacks.find((candidate) => candidate && !attemptedQueries.has(candidate.toLowerCase()));
-      if (fallbackQuery) return findBook(fallbackQuery, attemptedQueries, catalogMatchesFound);
+      if (fallbackQuery) return findBook(fallbackQuery, attemptedQueries, catalogMatchesFound, catalogIndex, catalogBaseURLs, searchSource);
       if (catalogMatchesFound > 0) {
         throw new CatalogMetadataError(`${catalogMatchesFound} catalog match${catalogMatchesFound === 1 ? '' : 'es'} found, but none exposes an MD5 usable by the download API`);
       }
@@ -253,6 +328,9 @@ export async function findBook(query: string, attemptedQueries = new Set<string>
 
     return bookList;
   } catch (error: any) {
+    const canTryNextCatalog = catalogIndex + 1 < catalogBaseURLs.length
+      && (error.response?.status === 403 || error.response?.status >= 500 || ['ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET'].includes(error.code));
+    if (canTryNextCatalog) return findBook(query, attemptedQueries, catalogMatchesFound, catalogIndex + 1, catalogBaseURLs, searchSource);
     // Check for 429 rate limit
     if (error.response?.status === 429) {
       const retryAfter = error.response.headers['retry-after']
@@ -260,7 +338,7 @@ export async function findBook(query: string, attemptedQueries = new Set<string>
         : undefined;
       throw new RateLimitError('Rate limit exceeded (429)', retryAfter);
     }
-    if (error instanceof CatalogMetadataError) throw error;
+    if (error instanceof CatalogMetadataError || error instanceof SearchAccessError) throw error;
     if (error.response?.status === 403) {
       throw new SearchAccessError('Anna\'s Archive blocked automated search with a browser verification challenge (HTTP 403). This is separate from the fast-download quota. Stop the scan and try again later, or configure an official working catalog domain with ANNAS_BASE_URL.');
     }
@@ -313,7 +391,6 @@ export async function downloadBook(
   onProgress?: (progress: number, transfer?: TransferInfo) => void,
   signal?: AbortSignal
 ): Promise<string> {
-  const apiURL = `${ANNAS_DOWNLOAD_ENDPOINT}?md5=${book.hash}&key=${secretKey}`;
   const extension = book.format.trim().replace(/^\.+/, '');
   if (!extension) throw new Error('Failed to download book: The selected edition does not specify a file format');
   const filename = safeDownloadFilename(book.title, extension, book.hash);
@@ -322,8 +399,12 @@ export async function downloadBook(
   const failures: string[] = [];
 
   const getDownloadResponse = async (downloadUrl: string) => {
+    const originalURL = new URL(downloadUrl);
+    if (originalURL.protocol !== 'https:' || originalURL.username || originalURL.password) {
+      throw new Error('Download URL must be a credential-free HTTPS URL');
+    }
     try {
-      return await axios.get(downloadUrl, { responseType: 'stream' as const, signal, timeout: REQUEST_TIMEOUT_MS });
+      return await axios.get(downloadUrl, { responseType: 'stream' as const, signal, timeout: FILE_REQUEST_TIMEOUT_MS });
     } catch (error: any) {
       if (error.code !== 'ENOTFOUND') throw error;
       const parsed = new URL(downloadUrl);
@@ -334,7 +415,7 @@ export async function downloadBook(
       return axios.get(parsed.toString(), {
         responseType: 'stream' as const,
         signal,
-        timeout: REQUEST_TIMEOUT_MS,
+        timeout: FILE_REQUEST_TIMEOUT_MS,
         headers: { Host: new URL(downloadUrl).hostname },
         httpsAgent: new https.Agent({ servername: new URL(downloadUrl).hostname }),
       });
@@ -386,49 +467,63 @@ export async function downloadBook(
 
   // Prefer the authenticated fast API. A confirmed quota response pauses the
   // entire run; only non-quota fast failures are eligible for slow fallback.
-  for (let attempt = 1; attempt <= FAST_DOWNLOAD_ATTEMPTS; attempt++) {
-    try {
-      const apiResp = await axios.get<FastDownloadResponse>(apiURL, { signal, timeout: REQUEST_TIMEOUT_MS });
-      if (!apiResp.data.download_url) {
-        const message = apiResp.data.error || 'Fast-download URL unavailable';
-        if (/\b(?:daily\s+)?limit\b|\bquota\b|too many fast downloads/i.test(message)) throw new RateLimitError(message);
-        throw new Error(message);
+  for (const downloadBaseURL of ANNAS_DOWNLOAD_BASE_URLS) {
+    const apiURL = `${downloadBaseURL}/dyn/api/fast_download.json`;
+    for (const domainIndex of FAST_DOWNLOAD_DOMAIN_INDEXES) {
+      let apiResp;
+      try {
+        apiResp = await axios.get<FastDownloadResponse>(apiURL, {
+          params: { md5: book.hash, key: secretKey, domain_index: domainIndex },
+          signal,
+          timeout: REQUEST_TIMEOUT_MS,
+        });
+        if (!apiResp.data.download_url) {
+          const message = apiResp.data.error || 'Fast-download URL unavailable';
+          if (/\b(?:daily\s+)?limit\b|\bquota\b|too many fast downloads/i.test(message)) throw new RateLimitError(message);
+          throw new Error(message);
+        }
+      } catch (error: any) {
+        if (optionsAbort(error, signal)) throw error;
+        if (error instanceof RateLimitError) throw error;
+        if (error.response?.status === 429) {
+          const retryAfter = error.response.headers?.['retry-after'] ? Number(error.response.headers['retry-after']) : undefined;
+          throw new RateLimitError(error.response.data?.error || 'Fast-download limit reached (429)', retryAfter);
+        }
+        failures.push(`fast API ${new URL(downloadBaseURL).hostname} domain ${domainIndex}: ${error.message || error}`);
+        if (error.response?.status === 401 || error.response?.status === 403) break;
+        continue;
       }
-      return await attemptUrl(apiResp.data.download_url, 'fast');
-    } catch (error: any) {
-      if (optionsAbort(error, signal)) throw error;
-      if (error instanceof RateLimitError) throw error;
-      if (error.response?.status === 429) {
-        const retryAfter = error.response.headers?.['retry-after'] ? Number(error.response.headers['retry-after']) : undefined;
-        throw new RateLimitError(error.response.data?.error || 'Fast-download limit reached (429)', retryAfter);
+
+      const mirrorHost = new URL(apiResp.data.download_url!).hostname;
+      try {
+        return await attemptUrl(apiResp.data.download_url!, 'fast');
+      } catch (error: any) {
+        if (optionsAbort(error, signal)) throw error;
+        failures.push(`fast mirror ${mirrorHost} domain ${domainIndex}: ${error.message || error}`);
       }
-      failures.push(`fast attempt ${attempt}: ${error.message || error}`);
-      if (error.response?.status === 401 || error.response?.status === 403) break;
-      if (attempt < FAST_DOWNLOAD_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
     }
   }
 
   // Probe the slow partner links exposed on the edition page in order.
-  try {
-    const editionUrl = `${ANNAS_DOWNLOAD_BASE_URL}/md5/${book.hash}`;
-    const parsedEditionUrl = new URL(editionUrl);
-    if (parsedEditionUrl.protocol !== 'https:' || parsedEditionUrl.hostname !== new URL(ANNAS_DOWNLOAD_BASE_URL).hostname) {
-      throw new Error('Refusing to request an untrusted edition URL');
-    }
-    const editionResponse = await axios.get(editionUrl, { signal, timeout: REQUEST_TIMEOUT_MS });
-    const page = cheerio.load(editionResponse.data);
-    const slowUrls = [...new Set(page('a[href^="/slow_download/"]').map((_index, element) => new URL(page(element).attr('href')!, ANNAS_DOWNLOAD_BASE_URL).toString()).get())];
-    for (const slowUrl of slowUrls) {
-      try { return await attemptUrl(slowUrl, 'slow'); }
-      catch (error: any) {
-        if (optionsAbort(error, signal)) throw error;
-        failures.push(`slow: ${error.message || error}`);
+  for (const downloadBaseURL of ANNAS_DOWNLOAD_BASE_URLS) {
+    try {
+      const editionUrl = `${downloadBaseURL}/md5/${book.hash}`;
+      if (!isTrustedAnnaURL(editionUrl, `/md5/${book.hash}`)) throw new Error('Refusing to request an untrusted edition URL');
+      const editionResponse = await axios.get(editionUrl, { signal, timeout: REQUEST_TIMEOUT_MS });
+      const page = cheerio.load(editionResponse.data);
+      const slowUrls = [...new Set(page('a[href^="/slow_download/"]').map((_index, element) => new URL(page(element).attr('href')!, downloadBaseURL).toString()).get())];
+      for (const slowUrl of slowUrls) {
+        try { return await attemptUrl(slowUrl, 'slow'); }
+        catch (error: any) {
+          if (optionsAbort(error, signal)) throw error;
+          failures.push(`slow ${new URL(downloadBaseURL).hostname}: ${error.message || error}`);
+        }
       }
+      if (!slowUrls.length) failures.push(`slow ${new URL(downloadBaseURL).hostname}: no slow partner links were available`);
+    } catch (error: any) {
+      if (optionsAbort(error, signal)) throw error;
+      failures.push(`slow probe ${new URL(downloadBaseURL).hostname}: ${error.message || error}`);
     }
-    if (!slowUrls.length) failures.push('slow: no slow partner links were available');
-  } catch (error: any) {
-    if (optionsAbort(error, signal)) throw error;
-    failures.push(`slow probe: ${error.message || error}`);
   }
   throw new Error(`Failed to download book: ${failures.join(' | ')}`);
 }
@@ -460,14 +555,87 @@ export function bookToJSON(book: Book): string {
 export function readCSV(csvPath: string): CSVRow[] {
   const fileContent = fs.readFileSync(csvPath, 'utf-8');
 
-  const records = parse(fileContent, {
+  return parseCSVContent(fileContent);
+}
+
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function displayLanguage(code: string): string {
+  const names: Record<string, string> = { en: 'English', es: 'Spanish', fr: 'French', de: 'German', it: 'Italian', pt: 'Portuguese' };
+  const normalized = code.trim().toLowerCase();
+  return normalized ? `${names[normalized] || code} [${code}]` : '';
+}
+
+/** Query the local Anna metadata index and return only records exposed through Anna's download service. */
+export function findBookInLocalMetadata(title: string, author: string, databasePath: string, limit = 50): Book[] {
+  if (!fs.existsSync(databasePath) || !fs.statSync(databasePath).isFile()) {
+    throw new Error(`Local metadata index not found: ${databasePath}`);
+  }
+  return searchLocalMetadata(databasePath, title, author, limit)
+    .filter((candidate) => candidate.hasAaDownload && candidate.extension)
+    .map((candidate) => ({
+      language: displayLanguage(candidate.language),
+      format: candidate.extension.toUpperCase(),
+      size: formatFileSize(candidate.filesize),
+      title: candidate.title,
+      publisher: candidate.publisher,
+      authors: candidate.author,
+      url: `${ANNAS_DOWNLOAD_BASE_URLS[0]}/md5/${candidate.md5}`,
+      hash: candidate.md5,
+      downloadCount: 0,
+      sourceRank: candidate.sourceRank,
+      searchSource: 'local_metadata',
+    }));
+}
+
+async function findBooksForRow(
+  title: string,
+  author: string,
+  config: Config,
+  isUsable: (books: Book[]) => boolean = (books) => books.length > 0
+): Promise<Book[]> {
+  let localBooks: Book[] | undefined;
+  if (config.metadataIndex) {
+    // A configured local index is always queried first. Only a valid-but-
+    // unhelpful local result set may proceed to an explicitly enabled fallback;
+    // index access/corruption errors remain visible and never leak a title.
+    localBooks = findBookInLocalMetadata(title, author, config.metadataIndex);
+    if (isUsable(localBooks) || !config.untrustedCatalogSearch) return localBooks;
+  }
+  if (!config.untrustedCatalogSearch) {
+    throw new SearchProviderConfigurationError(
+      'No metadata search provider is enabled. Configure ANNA_METADATA_INDEX, or explicitly opt in to the untrusted catalog with ENABLE_UNTRUSTED_CATALOG_SEARCH=true.'
+    );
+  }
+  const books = await findBook(
+    buildBookSearchQuery(author, title),
+    new Set<string>(),
+    0,
+    0,
+    UNTRUSTED_CATALOG_BASE_URLS,
+    'untrusted_catalog'
+  );
+  return books.filter((book) => ['pdf', 'epub'].includes(book.format.trim().toLowerCase()));
+}
+
+export function parseCSVContent(fileContent: string): CSVRow[] {
+  return parse(fileContent, {
+    bom: true,
     columns: true,
     skip_empty_lines: true,
     trim: true,
     relax_column_count: true,
   }) as CSVRow[];
-
-  return records;
 }
 
 /**
@@ -475,16 +643,18 @@ export function readCSV(csvPath: string): CSVRow[] {
  */
 const MANAGED_DIAGNOSTIC_COLUMNS = [
   'status', 'error', 'matched_title', 'matched_author', 'match_confidence', 'download_route', 'average_speed',
-  'selected_hash', 'selected_url', 'selected_title', 'selected_authors', 'selected_publisher', 'selected_language', 'selected_format', 'selected_size',
+  'selected_hash', 'selected_url', 'selected_title', 'selected_authors', 'selected_publisher', 'selected_language', 'selected_format', 'selected_size', 'selected_source',
 ] as const;
 const MANAGED_CSV_COLUMNS = ['author', 'title', ...MANAGED_DIAGNOSTIC_COLUMNS] as const;
 
 export function updateCSVResult(
   csvPath: string,
   rowIndex: number,
-  result: Partial<Pick<CSVRow, typeof MANAGED_DIAGNOSTIC_COLUMNS[number]>>,
-  rows = readCSV(csvPath)
+  result: Partial<Pick<CSVRow, typeof MANAGED_DIAGNOSTIC_COLUMNS[number]>>
 ): void {
+  // Always merge into the latest on-disk copy. Long-running scans/downloads
+  // must not overwrite a manual match selection made after their initial read.
+  const rows = readCSV(csvPath);
   if (rowIndex >= 0 && rowIndex < rows.length) Object.assign(rows[rowIndex], result);
   const originalColumns = rows.flatMap((row) => Object.keys(row));
   const columns = [...new Set([...originalColumns, ...MANAGED_CSV_COLUMNS])];
@@ -504,13 +674,19 @@ export function updateCSVResult(
 /**
  * Load configuration from environment variables
  */
-export function loadConfig(): Config {
+export function loadConfig(options: { requireSecretKey?: boolean } = {}): Config {
   const secretKey = process.env.ANNAS_SECRET_KEY;
   const outputFolder = process.env.OUTPUT_FOLDER || './downloads';
-  const maxDownloads = process.env.MAX_DOWNLOADS ? parseInt(process.env.MAX_DOWNLOADS, 10) : undefined;
+  const maxDownloadsValue = process.env.MAX_DOWNLOADS?.trim();
+  const maxDownloads = maxDownloadsValue ? Number(maxDownloadsValue) : undefined;
+  const metadataIndex = process.env.ANNA_METADATA_INDEX?.trim();
+  const untrustedCatalogSearch = /^(?:1|true|yes|on)$/i.test(process.env.ENABLE_UNTRUSTED_CATALOG_SEARCH?.trim() || '');
 
-  if (!secretKey) {
+  if ((options.requireSecretKey ?? true) && !secretKey) {
     throw new Error('ANNAS_SECRET_KEY environment variable is required');
+  }
+  if (maxDownloads !== undefined && (!Number.isInteger(maxDownloads) || maxDownloads <= 0)) {
+    throw new Error('MAX_DOWNLOADS must be a positive integer');
   }
 
   // Create output folder if it doesn't exist
@@ -518,14 +694,16 @@ export function loadConfig(): Config {
     fs.mkdirSync(outputFolder, { recursive: true });
   }
 
-  return {
-    secretKey,
+  const config: Config = {
+    secretKey: secretKey || '',
     outputFolder,
-    preferredFormat: process.env.PREFERRED_FORMAT,
     preferredLanguage: process.env.PREFERRED_LANGUAGE,
     preferredPublisher: process.env.PREFERRED_PUBLISHER,
     maxDownloads,
   };
+  if (metadataIndex) config.metadataIndex = path.resolve(metadataIndex);
+  if (untrustedCatalogSearch) config.untrustedCatalogSearch = true;
+  return config;
 }
 
 /**
@@ -577,20 +755,18 @@ export async function processCSV(
   const pendingReviews: Array<{ rowIndex: number; book: Book; confidence: number }> = [];
   const startIndex = Math.min(rows.length, Math.max(0, Math.floor(options.startIndex || 0)));
 
-  for (let i = 0; i < startIndex; i++) {
-    options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: `Before selected start row ${startIndex + 1}` });
-  }
-
   for (let i = startIndex; i < rows.length; i++) {
     if (options.signal?.aborted) break;
-    const row = rows[i];
+    // Re-read the current row so selections made while an earlier row was
+    // downloading are honored instead of being replaced by this run's snapshot.
+    const row = readCSV(csvPath)[i];
     const bookNum = i + 1;
 
     // Skip if already downloaded or explicitly rejected during match review
     const existingStatus = row.status?.trim().toLowerCase();
     if (existingStatus === 'downloaded' || existingStatus === 'rejected') {
       console.log(`[${bookNum}/${totalBooks}] Skipping "${row.title}" by ${row.author} (${existingStatus})`);
-      options.onEvent?.({ rowIndex: i, status: 'skipped', progress: 100 });
+      options.onEvent?.({ rowIndex: i, status: existingStatus === 'downloaded' ? 'completed' : 'skipped', progress: existingStatus === 'downloaded' ? 100 : 0 });
       skippedCount++;
       continue;
     }
@@ -618,17 +794,24 @@ export async function processCSV(
           url: row.selected_url || '',
           hash: row.selected_hash,
           downloadCount: 0,
+          searchSource: row.selected_source === 'untrusted_catalog' || row.selected_source === 'local_metadata'
+            ? row.selected_source
+            : 'preselected',
         };
         console.log(`  📚 Using pre-selected match: ${selectedBook.format} (${selectedBook.size})`);
       } else {
         // Search for the book
         options.onEvent?.({ rowIndex: i, status: 'searching', progress: 0 });
-        const query = buildBookSearchQuery(row.author, row.title);
-        const books = await findBook(query);
+        const books = await findBooksForRow(
+          row.title,
+          row.author,
+          config,
+          (localCandidates) => Boolean(selectReliableBook(localCandidates, config, row.title, row.author).book)
+        );
 
         if (books.length === 0) {
           console.log(`  ❌ No results found\n`);
-          updateCSVResult(csvPath, i, { status: 'failed', error: 'No results found', matched_title: '', matched_author: '', match_confidence: '' }, rows);
+          updateCSVResult(csvPath, i, { status: 'failed', error: 'No results found', matched_title: '', matched_author: '', match_confidence: '' });
           options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message: 'No results found' });
           failCount++;
           continue;
@@ -643,13 +826,20 @@ export async function processCSV(
           const message = candidate
             ? `No reliable match (best: "${candidate.title}", ${Math.round(selection.confidence * 100)}% confidence)`
             : 'No matching edition found';
-          updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: candidate?.title || '', matched_author: candidate?.authors || '', match_confidence: String(Math.round(selection.confidence * 100)) }, rows);
+          updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: candidate?.title || '', matched_author: candidate?.authors || '', match_confidence: String(Math.round(selection.confidence * 100)) });
           options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message, matchTitle: candidate?.title, matchAuthors: candidate?.authors, confidence: selection.confidence });
           failCount++;
           continue;
         }
 
-        updateCSVResult(csvPath, i, { status: 'matched', error: '', matched_title: picked.title, matched_author: picked.authors, match_confidence: String(Math.round(selection.confidence * 100)) }, rows);
+        updateCSVResult(csvPath, i, { status: 'matched', error: '', matched_title: picked.title, matched_author: picked.authors, match_confidence: String(Math.round(selection.confidence * 100)) });
+        if (picked.searchSource === 'untrusted_catalog') {
+          const message = 'Untrusted-catalog match requires manual review before download';
+          updateCSVResult(csvPath, i, { status: 'pending_review', error: '', matched_title: picked.title, matched_author: picked.authors, match_confidence: String(Math.round(selection.confidence * 100)) });
+          if (options.confirmMatch) pendingReviews.push({ rowIndex: i, book: picked, confidence: selection.confidence });
+          options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message, format: picked.format, size: picked.size, matchTitle: picked.title, matchAuthors: picked.authors, confidence: selection.confidence });
+          continue;
+        }
         // Matches above 80% download automatically. Lower reliable matches are
         // deferred so the automatic matching pass can continue to the next row.
         if (options.confirmMatch && selection.confidence <= 0.8) {
@@ -680,19 +870,19 @@ export async function processCSV(
 
       if (verifyDownload(filePath)) {
         console.log(`  ✅ Downloaded and verified successfully\n`);
-        updateCSVResult(csvPath, i, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' }, rows);
+        updateCSVResult(csvPath, i, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' });
         options.onEvent?.({ rowIndex: i, status: 'completed', progress: 100, format: selectedBook.format, size: selectedBook.size });
         successCount++;
       } else {
         console.log(`  ❌ Download verification failed\n`);
-        updateCSVResult(csvPath, i, { status: 'failed', error: 'Download verification failed' }, rows);
+        updateCSVResult(csvPath, i, { status: 'failed', error: 'Download verification failed' });
         options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message: 'Download verification failed' });
         failCount++;
       }
     } catch (error) {
       // Handle rate limiting
       if (error instanceof RateLimitError) {
-        updateCSVResult(csvPath, i, { status: 'queued', error: error.message }, rows);
+        updateCSVResult(csvPath, i, { status: 'queued', error: error.message });
         options.onEvent?.({ rowIndex: i, status: 'queued', progress: 0, message: error.message });
         console.log(`\n${'='.repeat(50)}`);
         console.log(`⚠️  RATE LIMIT EXCEEDED (429)`);
@@ -712,7 +902,7 @@ export async function processCSV(
 
       console.log(`  ❌ Error: ${error}\n`);
       const message = error instanceof Error ? error.message : String(error);
-      updateCSVResult(csvPath, i, { status: 'failed', error: message }, rows);
+      updateCSVResult(csvPath, i, { status: 'failed', error: message });
       options.onEvent?.({ rowIndex: i, status: 'failed', progress: 0, message });
       failCount++;
     }
@@ -731,7 +921,7 @@ export async function processCSV(
     const decision = await options.confirmMatch!(rowIndex, book, confidence);
     if (options.signal?.aborted) break;
     if (decision === 'skip') {
-      updateCSVResult(csvPath, rowIndex, { status: 'skipped', error: 'Skipped by user' }, rows);
+      updateCSVResult(csvPath, rowIndex, { status: 'skipped', error: 'Skipped by user' });
       options.onEvent?.({ rowIndex, status: 'skipped', progress: 0, message: 'Skipped by user', matchTitle: book.title, matchAuthors: book.authors, confidence });
       skippedCount++;
       continue;
@@ -745,18 +935,18 @@ export async function processCSV(
           options.onEvent?.({ rowIndex, status: 'downloading', progress, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence, message: transfer ? `${transfer.route} route · ${formatTransferSpeed(transfer.bytesPerSecond)}` : undefined });
         }, options.signal);
       if (!verifyDownload(filePath)) throw new Error('Download verification failed');
-      updateCSVResult(csvPath, rowIndex, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' }, rows);
+      updateCSVResult(csvPath, rowIndex, { status: 'downloaded', error: '', download_route: completedTransfer?.route || '', average_speed: completedTransfer ? formatTransferSpeed(completedTransfer.bytesPerSecond) : '' });
       options.onEvent?.({ rowIndex, status: 'completed', progress: 100, format: book.format, size: book.size, matchTitle: book.title, matchAuthors: book.authors, confidence });
       successCount++;
     } catch (error) {
       if (options.signal?.aborted || axios.isCancel(error)) break;
       if (error instanceof RateLimitError) {
-        updateCSVResult(csvPath, rowIndex, { status: 'queued', error: error.message }, rows);
+        updateCSVResult(csvPath, rowIndex, { status: 'queued', error: error.message });
         options.onEvent?.({ rowIndex, status: 'queued', progress: 0, message: error.message, matchTitle: book.title, matchAuthors: book.authors, confidence });
         throw error;
       }
       const message = error instanceof Error ? error.message : String(error);
-      updateCSVResult(csvPath, rowIndex, { status: 'failed', error: message }, rows);
+      updateCSVResult(csvPath, rowIndex, { status: 'failed', error: message });
       options.onEvent?.({ rowIndex, status: 'failed', progress: 0, message, matchTitle: book.title, matchAuthors: book.authors, confidence });
       failCount++;
     }
@@ -773,16 +963,16 @@ export async function processCSV(
  * Search and rank editions for a single CSV row, without writing anything.
  */
 export async function findRowCandidates(row: CSVRow, config: Config): Promise<MatchCandidate[]> {
-  const query = buildBookSearchQuery(row.author, row.title);
-  const books = await findBook(query);
   const titleOnly = isPlaceholderAuthor(row.author);
-  return rankCandidates(books, config, row.title, row.author)
+  const rankUsable = (books: Book[]) => rankCandidates(books, config, row.title, row.author)
     .filter((candidate) => candidate.titleScore >= 0.45 && candidate.confidence >= 0.45 && (titleOnly || candidate.authorScore >= 0.3))
     .slice(0, 10);
+  const books = await findBooksForRow(row.title, row.author, config, (localCandidates) => rankUsable(localCandidates).length > 0);
+  return rankUsable(books);
 }
 
 /** Persist a chosen edition as the durable, download-ready match for a row. */
-export function applySelectedMatch(csvPath: string, rowIndex: number, candidate: MatchCandidate, rows?: CSVRow[]): void {
+export function applySelectedMatch(csvPath: string, rowIndex: number, candidate: MatchCandidate): void {
   updateCSVResult(csvPath, rowIndex, {
     status: 'matched',
     error: '',
@@ -797,7 +987,8 @@ export function applySelectedMatch(csvPath: string, rowIndex: number, candidate:
     selected_language: candidate.book.language,
     selected_format: candidate.book.format,
     selected_size: candidate.book.size,
-  }, rows);
+    selected_source: candidate.book.searchSource || '',
+  });
 }
 
 /** Durably record that none of the reviewed candidates were acceptable for a row. */
@@ -813,6 +1004,7 @@ export function rejectRowMatch(csvPath: string, rowIndex: number, reason = 'No a
     selected_language: '',
     selected_format: '',
     selected_size: '',
+    selected_source: '',
   });
 }
 
@@ -829,6 +1021,7 @@ export interface MatchEvent {
 export interface ScanOptions {
   signal?: AbortSignal;
   onEvent?: (event: MatchEvent) => void;
+  startIndex?: number;
 }
 
 /**
@@ -838,12 +1031,13 @@ export interface ScanOptions {
  */
 export async function scanMatches(csvPath: string, config: Config, options: ScanOptions = {}): Promise<void> {
   const rows = readCSV(csvPath);
+  const startIndex = Math.min(rows.length, Math.max(0, Math.floor(options.startIndex || 0)));
 
-  for (let i = 0; i < rows.length; i++) {
+  for (let i = startIndex; i < rows.length; i++) {
     if (options.signal?.aborted) break;
-    const row = rows[i];
+    const row = readCSV(csvPath)[i];
     const status = row.status?.trim().toLowerCase();
-    if (status === 'downloaded' || status === 'rejected' || status === 'matched') continue;
+    if (status === 'downloaded' || status === 'rejected' || status === 'matched' || row.selected_hash) continue;
 
     options.onEvent?.({ rowIndex: i, status: 'scanning' });
 
@@ -855,14 +1049,16 @@ export async function scanMatches(csvPath: string, config: Config, options: Scan
       // (anything above the standard 80% confidence auto-accepts). Once a preferred publisher
       // is set, only a token-exact match auto-accepts, so everything else surfaces for review —
       // giving the user a chance to notice and pick a preferred-publisher edition among the top 10.
-      const autoAccept = top && (top.isExactMatch || (!config.preferredPublisher?.trim() && top.confidence > 0.8));
+      const autoAccept = top
+        && top.book.searchSource !== 'untrusted_catalog'
+        && (top.isExactMatch || (!config.preferredPublisher?.trim() && top.confidence > 0.8));
 
       if (candidates.length === 0) {
         const message = 'No sufficiently close downloadable match found';
-        updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: '', matched_author: '', match_confidence: '' }, rows);
+        updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: '', matched_author: '', match_confidence: '' });
         options.onEvent?.({ rowIndex: i, status: 'failed', message });
       } else if (autoAccept) {
-        applySelectedMatch(csvPath, i, candidates[0], rows);
+        applySelectedMatch(csvPath, i, candidates[0]);
         options.onEvent?.({ rowIndex: i, status: 'matched', candidates, selected: candidates[0] });
       } else {
         updateCSVResult(csvPath, i, {
@@ -871,7 +1067,7 @@ export async function scanMatches(csvPath: string, config: Config, options: Scan
           matched_title: candidates[0].book.title,
           matched_author: candidates[0].book.authors,
           match_confidence: String(Math.round(candidates[0].confidence * 100)),
-        }, rows);
+        });
         options.onEvent?.({ rowIndex: i, status: 'needs_review', candidates });
       }
     } catch (error) {
@@ -881,11 +1077,11 @@ export async function scanMatches(csvPath: string, config: Config, options: Scan
         throw error;
       }
       const message = error instanceof Error ? error.message : String(error);
-      updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: '', matched_author: '', match_confidence: '' }, rows);
+      updateCSVResult(csvPath, i, { status: 'failed', error: message, matched_title: '', matched_author: '', match_confidence: '' });
       options.onEvent?.({ rowIndex: i, status: 'failed', message });
     }
 
-    if (i < rows.length - 1) {
+    if (!config.metadataIndex && i < rows.length - 1) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
@@ -902,7 +1098,6 @@ async function main() {
     console.error('\nEnvironment variables:');
     console.error('  ANNAS_SECRET_KEY (required) - Your Anna\'s Archive secret key');
     console.error('  OUTPUT_FOLDER (optional) - Download destination (default: ./downloads)');
-    console.error('  PREFERRED_FORMAT (optional) - Preferred format (e.g., pdf, epub)');
     console.error('  PREFERRED_LANGUAGE (optional) - Preferred language (e.g., English)');
     process.exit(1);
   }
@@ -1026,7 +1221,9 @@ export function rankCandidates(
   }).sort((left, right) => {
     const leftRank = left.confidence + (isPreferredPublisher(left.book.publisher, config.preferredPublisher) ? PUBLISHER_PREFERENCE_BOOST : 0);
     const rightRank = right.confidence + (isPreferredPublisher(right.book.publisher, config.preferredPublisher) ? PUBLISHER_PREFERENCE_BOOST : 0);
-    return rightRank - leftRank || right.book.downloadCount - left.book.downloadCount;
+    return rightRank - leftRank
+      || right.book.downloadCount - left.book.downloadCount
+      || (right.book.sourceRank || 0) - (left.book.sourceRank || 0);
   });
 }
 

@@ -1,25 +1,30 @@
 # Anna's Archive Downloader
 
-A TypeScript utility for batch downloading books from Anna's Archive using a CSV input file.
+A local TypeScript application for matching CSV reading lists to book metadata, reviewing editions, and managing verified downloads.
+
+> This project is unaffiliated with Anna's Archive or any catalog provider. You are responsible for complying with copyright law, provider terms, and the laws that apply where you live. Use it only for material you are legally permitted to access.
 
 ## Features
 
 - **Batch processing** - Process multiple books from a CSV file
-- **Preliminary match review** - Scan every row for the best edition before downloading anything; only exact matches are picked automatically, everything else waits for you to choose from the top 10
-- **Smart filtering** - Filter by preferred format (pdf, epub, mobi) and language
+- **Preliminary match review** - Scan every row before downloading; usable local matches may be selected automatically while untrusted-catalog results always wait for review
+- **Smart filtering** - Filter by preferred language and reject editions without a usable format
 - **Publisher preference** - Set a preferred publisher (e.g. Penguin) in the UI or `.env`; matching editions rank slightly higher among otherwise-comparable candidates
 - **Format-aware fallback** - Prefers PDFs under 50 MB, then other small formats, then larger PDFs, then larger alternative formats
 - **Progress tracking** - CSV status updates track download progress
 - **Resume capability** - Automatically skips already downloaded books
+- **Existing-library reconciliation** - On CSV import, recursively checks a configured library folder for editions already on disk
 - **Row-based starts** - Begin a run at any 1-based CSV row without processing earlier entries
 - **Alternative matching** - Skips unsuitable search results and rotates to the next reliable edition
+- **Local metadata search** - Searches a compact SQLite FTS index built from Anna's metadata dump, avoiding automated catalog title queries
+- **Contained web fallback** - Optionally extracts MD5 leads from an explicitly configured untrusted catalog without trusting it as a download origin
 - **Rate limit handling** - Handles 429 responses gracefully
 - **Download verification** - Validates file completeness and PDF/EPUB signatures
 - **Configurable limits** - Set maximum downloads per run
 
 ## Prerequisites
 
-- Node.js 20 or newer
+- Node.js 22.13 or newer
 - Anna's Archive secret key (for fast downloads)
 
 ## Installation
@@ -38,15 +43,57 @@ cp .env.example .env
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ANNAS_SECRET_KEY` | Yes | - | Your Anna's Archive API key for fast downloads |
-| `ANNAS_BASE_URL` | No | `https://annas-archive.is` | Search catalog host |
+| `ANNAS_SECRET_KEY` | For downloads | - | Anna's Archive API key for fast downloads; local scanning does not require it |
+| `ANNA_METADATA_INDEX` | Recommended | - | SQLite index built from local metadata; it is always queried before any enabled web fallback |
 | `ANNAS_DOWNLOAD_BASE_URL` | No | `https://annas-archive.gl` | MD5 member-download API host |
-| `GOOGLE_BOOKS_KEY` | For list builder | - | Google Books API key used by the local search service |
+| `ENABLE_UNTRUSTED_CATALOG_SEARCH` | No | `false` | Affirmative opt-in used only when local metadata has no sufficiently close match |
+| `UNTRUSTED_CATALOG_BASE_URL` | No | `https://annas-archive.is` | Search-only origin for opt-in untrusted mode; never added to trusted download hosts |
+| `UNTRUSTED_CATALOG_BASE_URLS` | No | - | Optional comma-separated search-only fallback origins |
+| `ANNAS_DOWNLOAD_BASE_URLS` | No | - | Comma-separated member-download origins tried in order before `ANNAS_DOWNLOAD_BASE_URL` |
+| `ANNAS_TRUSTED_HOSTS` | No | - | Extra exact hostnames accepted for candidate links; wildcards are rejected |
+| `ANNAS_FAST_DOMAIN_INDEXES` | No | `6,7,1,2,8,9,0` | Anna fast-download server indexes tried in order; rotates signed mirror URLs when one partner is unavailable |
+| `OPENAI_API_KEY` / `OPENAI_KEY` | For list builder | - | OpenAI API key used to generate curated book lists |
+| Other provider keys | No | - | `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `COHERE_API_KEY`, or `PERPLEXITY_API_KEY` |
 | `OUTPUT_FOLDER` | No | `./downloads` | Directory for downloaded books |
-| `PREFERRED_FORMAT` | No | - | Filter by format (pdf, epub, mobi) |
+| `UI_PORT` | No | `4173` | Loopback-only web interface port |
+| `LIBRARY_SCAN_FOLDER` | No | `OUTPUT_FOLDER` | Existing library root scanned recursively on CSV import to restore downloaded statuses |
 | `PREFERRED_LANGUAGE` | No | - | Filter by language (English, Spanish, etc.) |
 | `PREFERRED_PUBLISHER` | No | - | Editions from a publisher containing this text rank higher (e.g., `Penguin`); also editable from the web UI |
 | `MAX_DOWNLOADS` | No | unlimited | Maximum books to download per run |
+
+### Build the local metadata index
+
+Build one SQLite index from all downloaded `aarecords__*.json.gz` shards. The source may be either the torrent root or its `elasticsearch` directory:
+
+```powershell
+npm run metadata:cli -- index --source "./metadata" --database "./metadata/anna-metadata.sqlite"
+```
+
+Then set the completed database in `.env` and restart the app:
+
+```dotenv
+ANNA_METADATA_INDEX=./metadata/anna-metadata.sqlite
+```
+
+For a bounded smoke test, add `--shard 0 --max-records 1000000`. You can benchmark any `author,title` CSV against an index without modifying the CSV:
+
+```powershell
+npm run metadata:cli -- benchmark --database "./metadata/anna-metadata.sqlite" --csv "./reading-list.csv"
+```
+
+### Opt in to the untrusted catalog fallback
+
+If you cannot use a local metadata index, or want a fallback for rows with no usable local match, you can explicitly enable the search-only fallback:
+
+```dotenv
+ANNA_METADATA_INDEX=
+ENABLE_UNTRUSTED_CATALOG_SEARCH=true
+UNTRUSTED_CATALOG_BASE_URL=https://annas-archive.is
+```
+
+This origin is unaffiliated and must be treated as hostile. The client sends only a title query with generic `User-Agent`/`Accept` headers: it does not send API keys, cookies, credentials, or a referrer. Redirects must remain on the exact configured origin, HTML responses are capped at 5 MB, and only strict 32-character hexadecimal MD5 values are accepted. Candidate links are rebuilt on `ANNAS_DOWNLOAD_BASE_URL`; the untrusted host is never trusted for downloads. Results are limited to PDF/EPUB, visibly labeled in the UI, and require a manual selection even when the title and author match exactly. Set `ENABLE_UNTRUSTED_CATALOG_SEARCH=false` at any time as the kill switch, then restart the app.
+
+Provider order is strict: the configured local index is queried and ranked first. A web fallback is contacted only when the local index returns no candidate that satisfies the normal match threshold. If the local database is missing or corrupt, the scan fails visibly instead of silently sending the title elsewhere.
 
 ## Usage
 
@@ -60,9 +107,9 @@ npm run ui
 
 Then open [http://127.0.0.1:4173](http://127.0.0.1:4173). The service binds only to the local machine. Choose a CSV from your computer, review the parsed queue, and select **Start downloads**. The interface reports search, download, completion, skipped, and failure states for each row, including byte-level progress when the download server provides a content length. The secret key remains on the local Node server and is never sent to the browser.
 
-Before downloading, you can select **Scan matches** to preview and choose editions ahead of time. Set a **Preferred publisher** (e.g. `Penguin`) to rank matching editions higher; with a preference set, only token-exact title/author matches are picked automatically and everything else is marked for review with its top 10 candidates (title, authors, publisher, language, format, size, popularity, and match confidence — matching editions are flagged). Leave the field blank and scanning behaves like a normal download run, auto-accepting any match above 80% confidence. Click a row's **Change match**/**Review again** link to open its candidate list, **Select** an edition, or **Reject** the title if nothing is acceptable. Once chosen, that exact edition is what **Start downloads** fetches — no re-searching. Scanning and downloading can't run at the same time.
+Before downloading, you can select **Scan matches** to preview and choose editions ahead of time. Set a **Preferred publisher** (e.g. `Penguin`) to rank matching editions higher; with a preference set, only token-exact title/author matches from trusted local metadata are picked automatically and everything else is marked for review with its top 10 candidates (title, authors, publisher, language, format, size, popularity, source, and match confidence — matching editions are flagged). Leave the field blank and local-metadata scanning auto-accepts matches above 80% confidence. Untrusted-catalog results are never auto-accepted. Click a row's **Change match**/**Review again** link to open its candidate list, **Select** an edition, or **Reject** the title if nothing is acceptable. Once chosen, that exact edition is what **Start downloads** fetches — no re-searching. Scanning and downloading can't run at the same time.
 
-The **Build a book list** tab searches Google Books by keyword, topic/genre, author, title, publisher, or ISBN. Select individual results or all currently loaded results, then either download an `author,title` CSV or send the selection directly to the downloader. Multiple authors are written with semicolons.
+The **Build a book list** tab uses a configured LLM provider to generate a curated reading list from a natural-language request. Choose a provider and model, specify the number of books, review or deselect suggestions, then download an `author,title` CSV or send the selection directly to the downloader. Generate-more requests exclude titles already in the current list. API keys remain on the local server.
 
 Use **Stop** to abort the active request safely. Downloaded files continue to use `OUTPUT_FOLDER` from `.env`.
 
@@ -95,13 +142,13 @@ Alfred Lansing,Endurance: Shackleton's Incredible Voyage
 
 ### Output
 
-The script automatically adds a `status` column, plus diagnostic columns (`error`, `matched_title`, `matched_author`, `match_confidence`) and, once a preliminary match has been chosen, `selected_*` columns describing the exact edition to download:
+The script automatically adds a `status` column, plus diagnostic columns (`error`, `matched_title`, `matched_author`, `match_confidence`) and, once a preliminary match has been chosen, `selected_*` columns describing the exact edition and its source:
 
 | Status | Meaning |
 |--------|---------|
 | (empty) | Not yet processed |
 | `matched` | A specific edition has been chosen (automatically or via match review) but not yet downloaded |
-| `pending_review` | Scanned, but no exact match — awaiting your pick from the top 10 in the UI |
+| `pending_review` | Scanned and awaiting your pick from the top candidates; all untrusted-catalog results use this state |
 | `rejected` | You reviewed the candidates and none were acceptable; never re-processed |
 | `downloaded` | Successfully downloaded and verified |
 | `failed` | Download failed or book not found |
@@ -142,6 +189,7 @@ To run the downloader automatically every day (useful for working around rate li
     <key>ProgramArguments</key>
     <array>
         <string>/path/to/anna-downloader/run-downloader.sh</string>
+        <string>/path/to/reading-list.csv</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -152,6 +200,8 @@ To run the downloader automatically every day (useful for working around rate li
     </dict>
     <key>StandardErrorPath</key>
     <string>/path/to/anna-downloader/logs/error.log</string>
+    <key>StandardOutPath</key>
+    <string>/path/to/anna-downloader/logs/downloader.log</string>
 </dict>
 </plist>
 ```
@@ -183,3 +233,11 @@ launchctl unload ~/Library/LaunchAgents/com.anna-downloader.daily.plist
 launchctl unload ~/Library/LaunchAgents/com.anna-downloader.daily.plist
 launchctl load ~/Library/LaunchAgents/com.anna-downloader.daily.plist
 ```
+
+## Security and contributions
+
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting and the local-only deployment boundary. Contribution setup and review expectations are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+No open-source license has been selected. The repository is currently published as `UNLICENSED`; choose and add a license before inviting redistribution or reuse.

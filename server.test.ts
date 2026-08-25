@@ -28,7 +28,7 @@ describe('HTTP API', () => {
     const response = await fetch(`${baseUrl}/api/destination`);
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toContain('application/json');
-    expect(await response.json()).toEqual(expect.objectContaining({ path: expect.any(String), exists: expect.any(Boolean) }));
+    expect(await response.json()).toEqual(expect.objectContaining({ path: expect.any(String), exists: expect.any(Boolean), canBrowse: expect.any(Boolean) }));
   });
 
   it('returns restorable session state', async () => {
@@ -37,6 +37,14 @@ describe('HTTP API', () => {
     expect(await response.json()).toEqual(expect.objectContaining({
       rows: expect.any(Array), destination: expect.any(String), runState: expect.any(String), scanState: expect.any(String),
     }));
+  });
+
+  it('reports LLM provider availability without returning credentials', async () => {
+    const response = await fetch(`${baseUrl}/api/llm/providers`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { providers: Array<Record<string, unknown>> };
+    expect(body.providers).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'openai', label: 'OpenAI', configured: expect.any(Boolean), model: expect.any(String) })]));
+    expect(JSON.stringify(body)).not.toMatch(/sk-[a-z0-9]/i);
   });
 
   it('rejects an empty CSV import without mutating the catalog', async () => {

@@ -1,76 +1,115 @@
-import { FormEvent, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { readApiResponse } from './api';
 
-type SearchField = 'keyword' | 'subject' | 'author' | 'title' | 'publisher' | 'isbn';
-type GoogleBook = {
-  id: string; title: string; authors: string[]; publishedDate: string; categories: string[];
-  description: string; thumbnail: string; publisher: string; isbn: string;
-};
-
-const fieldOptions: Array<{ value: SearchField; label: string }> = [
-  { value: 'keyword', label: 'Any keyword' },
-  { value: 'subject', label: 'Topic / genre' },
-  { value: 'author', label: 'Author' },
-  { value: 'title', label: 'Title' },
-  { value: 'publisher', label: 'Publisher' },
-  { value: 'isbn', label: 'ISBN' },
-];
+type LLMProvider = { id: string; label: string; configured: boolean; model: string };
+type GeneratedBook = { id: string; author: string; title: string; reason: string };
 
 function csvCell(value: string) { return `"${value.replace(/"/g, '""')}"`; }
-function booksToCSV(books: GoogleBook[]) {
-  return `author,title\r\n${books.map((book) => `${csvCell(book.authors.join('; '))},${csvCell(book.title)}`).join('\r\n')}\r\n`;
+function booksToCSV(books: GeneratedBook[]) {
+  return `author,title\r\n${books.map((book) => `${csvCell(book.author)},${csvCell(book.title)}`).join('\r\n')}\r\n`;
 }
 function fileSlug(value: string) { return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'books'; }
+function bookId(book: { author: string; title: string }) { return `${book.author.trim().toLowerCase()}|${book.title.trim().toLowerCase()}`; }
 
 export function BookListBuilder({ onUseInDownloader }: { onUseInDownloader: (csv: string, name: string) => Promise<void> }) {
-  const [field, setField] = useState<SearchField>('subject');
-  const [query, setQuery] = useState('');
-  const [pageSize, setPageSize] = useState(20);
-  const [books, setBooks] = useState<GoogleBook[]>([]);
+  const [providers, setProviders] = useState<LLMProvider[]>([]);
+  const [providerId, setProviderId] = useState('');
+  const [model, setModel] = useState('');
+  const [prompt, setPrompt] = useState('');
+  const [count, setCount] = useState(20);
+  const [books, setBooks] = useState<GeneratedBook[]>([]);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
-  const [totalItems, setTotalItems] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [loadingProviders, setLoadingProviders] = useState(true);
   const [error, setError] = useState('');
-  const [hasSearched, setHasSearched] = useState(false);
+  const [hasGenerated, setHasGenerated] = useState(false);
   const [transferMessage, setTransferMessage] = useState('');
+  const [lastProviderLabel, setLastProviderLabel] = useState('');
+
+  useEffect(() => {
+    fetch('/api/llm/providers')
+      .then((response) => readApiResponse<{ providers: LLMProvider[]; error?: string }>(response).then((data) => ({ response, data })))
+      .then(({ response, data }) => {
+        if (!response.ok) throw new Error(data.error || 'Could not load LLM providers.');
+        setProviders(data.providers);
+        const first = data.providers.find((provider) => provider.configured);
+        if (first) { setProviderId(first.id); setModel(first.model); }
+      })
+      .catch((caught) => setError(caught instanceof Error ? caught.message : 'Could not load LLM providers.'))
+      .finally(() => setLoadingProviders(false));
+  }, []);
 
   const selectedBooks = useMemo(() => books.filter((book) => selected.has(book.id)), [books, selected]);
   const allSelected = books.length > 0 && books.every((book) => selected.has(book.id));
-  const resultLabel = totalItems > 1000 ? `${totalItems.toLocaleString()}+` : totalItems.toLocaleString();
+  const selectedProvider = providers.find((provider) => provider.id === providerId);
+  const configuredCount = providers.filter((provider) => provider.configured).length;
 
-  async function fetchBooks(startIndex: number, append: boolean) {
-    if (!query.trim()) { setError('Enter a search query.'); return; }
-    setLoading(true); setError(''); setTransferMessage('');
-    try {
-      const params = new URLSearchParams({ query: query.trim(), field, startIndex: String(startIndex), maxResults: String(pageSize) });
-      const response = await fetch(`/api/google-books/search?${params}`);
-      const data = await readApiResponse<{ books: GoogleBook[]; totalItems: number; error?: string }>(response);
-      if (!response.ok) throw new Error(data.error || 'Google Books search failed.');
-      setBooks((current) => append ? [...current, ...data.books.filter((next: GoogleBook) => !current.some((book) => book.id === next.id))] : data.books);
-      setTotalItems(data.totalItems); setHasSearched(true);
-      if (!append) setSelected(new Set());
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Google Books search failed.'); }
-    finally { setLoading(false); }
+  function changeProvider(nextId: string) {
+    setProviderId(nextId);
+    setModel(providers.find((provider) => provider.id === nextId)?.model || '');
   }
 
-  function search(event: FormEvent) { event.preventDefault(); void fetchBooks(0, false); }
+  async function generate(append: boolean) {
+    if (!prompt.trim()) { setError('Describe the book list you want.'); return; }
+    if (!selectedProvider?.configured) { setError('Choose a provider with a configured API key.'); return; }
+    setLoading(true); setError(''); setTransferMessage('');
+    try {
+      const response = await fetch('/api/llm/book-list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: providerId,
+          model,
+          prompt: prompt.trim(),
+          count,
+          excludedTitles: append ? books.map((book) => book.title) : [],
+        }),
+      });
+      const data = await readApiResponse<{ books: Array<Omit<GeneratedBook, 'id'>>; provider: string; model: string; error?: string }>(response);
+      if (!response.ok) throw new Error(data.error || 'The LLM could not generate a book list.');
+      const generated = data.books.map((book) => ({ ...book, id: bookId(book) }));
+      setBooks((current) => append
+        ? [...current, ...generated.filter((next) => !current.some((book) => book.id === next.id))]
+        : generated);
+      setSelected((current) => append ? new Set([...current, ...generated.map((book) => book.id)]) : new Set(generated.map((book) => book.id)));
+      setHasGenerated(true);
+      setModel(data.model);
+      setLastProviderLabel(providers.find((provider) => provider.id === data.provider)?.label || data.provider);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The LLM could not generate a book list.');
+    } finally { setLoading(false); }
+  }
+
+  function submit(event: FormEvent) { event.preventDefault(); void generate(false); }
   function toggle(id: string) { setSelected((current) => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next; }); }
   function toggleAll() { setSelected(allSelected ? new Set() : new Set(books.map((book) => book.id))); }
   function downloadCSV() {
-    const csv = booksToCSV(selectedBooks); const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-    const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${fileSlug(query)}-books.csv`; anchor.click(); URL.revokeObjectURL(url);
+    const csv = booksToCSV(selectedBooks);
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${fileSlug(prompt)}-books.csv`; anchor.click(); URL.revokeObjectURL(url);
   }
   async function useInDownloader() {
-    try { setTransferMessage(''); await onUseInDownloader(booksToCSV(selectedBooks), `${fileSlug(query)}-books.csv`); }
-    catch (caught) { setTransferMessage(caught instanceof Error ? caught.message : 'Could not create downloader list.'); }
+    try {
+      setTransferMessage('');
+      await onUseInDownloader(booksToCSV(selectedBooks), `${fileSlug(prompt)}-books.csv`);
+    } catch (caught) { setTransferMessage(caught instanceof Error ? caught.message : 'Could not create downloader list.'); }
   }
 
-  return <section className="builder" aria-label="Build a book list">
-    <form className="book-search" onSubmit={search}>
-      <label><span>Search by</span><select value={field} onChange={(event) => setField(event.target.value as SearchField)}>{fieldOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>
-      <label className="query-label"><span>Search query</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={field === 'subject' ? 'e.g. Victorian science fiction' : `Search by ${field}`} /></label>
-      <button className="primary search-button" type="submit" disabled={loading}>{loading ? 'Searching…' : 'Search books'}</button>
-      <label className="page-size"><span>Results per page</span><select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}><option value="10">10</option><option value="20">20</option><option value="40">40</option></select></label>
+  return <section className="builder" aria-label="Build a book list with an LLM">
+    <div className="builder-intro">
+      <span>AI-assisted curation</span>
+      <h2>Shape a reading list around your question.</h2>
+      <p>Describe the subject, audience, depth, and viewpoints you want represented. Review every suggestion before exporting it or moving it into the downloader.</p>
+    </div>
+    <form className="book-search llm-book-search" onSubmit={submit}>
+      <label><span>LLM provider</span><select value={providerId} onChange={(event) => changeProvider(event.target.value)} disabled={loadingProviders || loading}>
+        {!providerId && <option value="">No configured provider</option>}
+        {providers.map((provider) => <option value={provider.id} key={provider.id} disabled={!provider.configured}>{provider.label}{provider.configured ? '' : ' — key missing'}</option>)}
+      </select></label>
+      <label><span>Model</span><input value={model} onChange={(event) => setModel(event.target.value)} placeholder="Provider model name" disabled={!providerId || loading} /></label>
+      <label className="count-label"><span>Number of books</span><select value={count} onChange={(event) => setCount(Number(event.target.value))} disabled={loading}><option value="10">10</option><option value="20">20</option><option value="30">30</option><option value="50">50</option><option value="75">75</option><option value="100">100</option></select></label>
+      <label className="prompt-label"><span>Describe the list</span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} maxLength={4000} placeholder="Example: Build a graduate-level reading list on urban housing supply, zoning reform, land-use economics, and the YIMBY movement. Include foundational books, empirical work, and thoughtful critiques." /></label>
+      <div className="llm-submit"><button className="primary search-button" type="submit" disabled={loading || !selectedProvider?.configured || !prompt.trim()}>{loading ? 'Generating…' : 'Generate book list'}</button><small>API keys stay on this local server and are never sent to the browser. {configuredCount} provider{configuredCount === 1 ? '' : 's'} configured.</small></div>
     </form>
 
     {error && <div className="builder-message error-builder" role="alert">{error}</div>}
@@ -78,25 +117,23 @@ export function BookListBuilder({ onUseInDownloader }: { onUseInDownloader: (csv
 
     <div className="results-frame">
       <div className="selection-toolbar">
-        <label className="check-label"><input type="checkbox" checked={allSelected} onChange={toggleAll} disabled={!books.length} />Select all {books.length ? `${books.length} loaded results` : 'results'}</label>
+        <label className="check-label"><input type="checkbox" checked={allSelected} onChange={toggleAll} disabled={!books.length} />Select all {books.length ? `${books.length} generated books` : 'books'}</label>
         <span className="selection-count">{selected.size} selected</span>
-        {hasSearched && <span className="total-results">{resultLabel} Google Books matches</span>}
+        {hasGenerated && <span className="total-results">Generated by {lastProviderLabel || selectedProvider?.label}{model ? ` · ${model}` : ''}</span>}
         <div className="selection-actions"><button className="secondary compact" disabled={!selected.size} onClick={downloadCSV}>Download CSV</button><button className="primary compact" disabled={!selected.size} onClick={useInDownloader}>Use in downloader</button></div>
       </div>
-      <div className="result-head"><span></span><span>Title &amp; author</span><span>Published</span><span>Categories</span><span>Description</span></div>
+      <div className="result-head llm-result-head"><span></span><span>Title &amp; author</span><span>Why it belongs</span></div>
 
-      {!books.length && !loading ? <div className="builder-empty"><h2>{hasSearched ? 'No books found' : 'Search Google Books'}</h2><p>{hasSearched ? 'Try a broader query or another search category.' : 'Find books by topic, genre, author, title, publisher, ISBN, or any keyword.'}</p></div> : books.map((book) => {
+      {!books.length && !loading ? <div className="builder-empty"><h2>{hasGenerated ? 'No books generated' : 'Generate a curated book list'}</h2><p>Describe a topic, audience, level, perspective, exclusions, or desired balance. The selected LLM will return a downloader-ready list you can review first.</p></div> : books.map((book) => {
         const isSelected = selected.has(book.id);
-        return <label className={`result-row ${isSelected ? 'selected' : ''}`} key={book.id}>
+        return <label className={`result-row llm-result-row ${isSelected ? 'selected' : ''}`} key={book.id}>
           <input type="checkbox" checked={isSelected} onChange={() => toggle(book.id)} aria-label={`Select ${book.title}`} />
-          <div className="result-identity">{book.thumbnail ? <img src={book.thumbnail} alt="" loading="lazy" /> : <div className="cover-placeholder" aria-hidden="true">Aa</div>}<div><strong>{book.title}</strong><span>{book.authors.join('; ')}</span>{book.publisher && <small>{book.publisher}</small>}</div></div>
-          <span>{book.publishedDate || '—'}</span>
-          <span className="categories">{book.categories.length ? book.categories.join('; ') : '—'}</span>
-          <span className="description">{book.description || 'No description available.'}</span>
+          <div className="result-identity"><div className="cover-placeholder" aria-hidden="true">Aa</div><div><strong>{book.title}</strong><span>{book.author}</span></div></div>
+          <span className="description">{book.reason || 'Recommended for the requested list.'}</span>
         </label>;
       })}
-      {loading && <div className="loading-results" aria-live="polite"><i/><span>Searching Google Books…</span></div>}
+      {loading && <div className="loading-results" aria-live="polite"><i/><span>Generating and validating book suggestions…</span></div>}
     </div>
-    {books.length > 0 && books.length < totalItems && <button className="load-more secondary" disabled={loading} onClick={() => fetchBooks(books.length, true)}>Load more</button>}
+    {books.length > 0 && <button className="load-more secondary" disabled={loading} onClick={() => void generate(true)}>Generate {count} more without duplicates</button>}
   </section>;
 }

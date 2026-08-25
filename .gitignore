@@ -1,5 +1,6 @@
 node_modules/
 downloads/
+test-downloads/
 logs/
 .ui-runtime/
 ui/dist/
@@ -7,10 +8,29 @@ dist/
 coverage/
 main.js
 .env
+.env.*
+!.env.example
 books.csv
 
 CSVs/
+metadata/
 *.log
+*.part
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.tgz
+*.torrent
+aarecords__*.json.gz
 *-qa.csv
 *-qa.js
 client_secret_*.apps.googleusercontent.com.json
+
+# Local editor, agent, and design-review state
+.claude/
+.codex/
+.vscode/
+llm-council/
+llm-council-*.json
+.DS_Store
+Thumbs.db

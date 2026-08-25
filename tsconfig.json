@@ -8,7 +8,7 @@
     "resolveJsonModule": true,
     "outDir": "./dist"
   },
-  "include": ["main.ts", "server.ts"],
+  "include": ["*.ts"],
   "exclude": ["ui", "node_modules", "**/*.test.ts"],
   "ts-node": {
     "esm": false,

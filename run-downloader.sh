@@ -1,3 +1,8 @@
-#!/bin/bash
-cd /Users/seanspade/Documents/Source/anna-downloader
-npm start >> logs/downloader.log 2>&1
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$project_dir"
+
+npm run build
+exec node dist/main.js "$@"
