@@ -40,6 +40,7 @@ export interface IndexProgress {
 export interface BuildIndexOptions {
   sourceFiles: string[];
   databasePath: string;
+  skipRecords?: number;
   maxRecords?: number;
   batchSize?: number;
   progressEvery?: number;
@@ -147,15 +148,12 @@ function initializeDatabase(database: DatabaseSync): boolean {
       has_external_download INTEGER NOT NULL,
       source_rank INTEGER NOT NULL
     ) STRICT;
-    CREATE INDEX IF NOT EXISTS records_md5 ON records(md5);
-    CREATE INDEX IF NOT EXISTS records_isbn13 ON records(isbn13) WHERE isbn13 <> '';
     CREATE TABLE IF NOT EXISTS record_search (
       record_id INTEGER PRIMARY KEY,
       title_key TEXT NOT NULL,
       author_key TEXT NOT NULL,
       FOREIGN KEY(record_id) REFERENCES records(id) ON DELETE CASCADE
     ) STRICT;
-    CREATE INDEX IF NOT EXISTS record_search_title_key ON record_search(title_key);
     CREATE TABLE IF NOT EXISTS index_metadata (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -181,10 +179,28 @@ export async function buildLocalMetadataIndex(options: BuildIndexOptions): Promi
   for (const sourceFile of options.sourceFiles) {
     if (!fs.existsSync(sourceFile)) throw new Error(`Metadata shard not found: ${sourceFile}`);
   }
+  const skipRecords = options.skipRecords ?? 0;
+  if (!Number.isInteger(skipRecords) || skipRecords < 0) throw new Error('skipRecords must be a non-negative integer.');
+  if (options.maxRecords !== undefined && skipRecords > options.maxRecords) {
+    throw new Error('skipRecords cannot exceed maxRecords.');
+  }
   fs.mkdirSync(path.dirname(options.databasePath), { recursive: true });
 
   const database = openDatabase(options.databasePath);
   const hasLegacyFts = initializeDatabase(database);
+  // IDs are append-only, so MAX(id) is the retained row total without a full
+  // COUNT(*) scan across a partial index containing tens of millions of rows.
+  const initialRecordRow = database.prepare('SELECT COALESCE(MAX(id), 0) AS count FROM records').get() as { count: number | bigint };
+  const initialRecords = Number(initialRecordRow.count);
+  // Secondary indexes make a large ingest degenerate into random writes. They
+  // contain no unique data, so remove them during ingestion and rebuild them
+  // once, sequentially, after every source shard has been consumed. The old
+  // records_md5 index is redundant with the UNIQUE constraint on records.md5.
+  database.exec(`
+    DROP INDEX IF EXISTS records_md5;
+    DROP INDEX IF EXISTS records_isbn13;
+    DROP INDEX IF EXISTS record_search_title_key;
+  `);
   const insert = database.prepare(`
     INSERT OR IGNORE INTO records (
       md5, title, author, publisher, language, extension, filesize, content_type,
@@ -197,7 +213,7 @@ export async function buildLocalMetadataIndex(options: BuildIndexOptions): Promi
   const progressEvery = Math.max(batchSize, options.progressEvery ?? 50_000);
   const startedAt = Date.now();
   let recordsRead = 0;
-  let recordsInserted = 0;
+  let recordsInserted = initialRecords;
   let recordsSkipped = 0;
   let malformedRecords = 0;
   let filesCompleted = 0;
@@ -227,6 +243,10 @@ export async function buildLocalMetadataIndex(options: BuildIndexOptions): Promi
           break;
         }
         recordsRead += 1;
+        if (recordsRead <= skipRecords) {
+          if (recordsRead % progressEvery === 0) options.onProgress?.(progress(sourceFile));
+          continue;
+        }
         try {
           const record = parseAnnaMetadataLine(line);
           if (!record) recordsSkipped += 1;
@@ -258,6 +278,10 @@ export async function buildLocalMetadataIndex(options: BuildIndexOptions): Promi
 
     // Existing FTS-based indexes remain appendable and need an explicit rebuild.
     if (hasLegacyFts) database.exec("INSERT INTO records_fts(records_fts) VALUES('rebuild')");
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS records_isbn13 ON records(isbn13) WHERE isbn13 <> '';
+      CREATE INDEX IF NOT EXISTS record_search_title_key ON record_search(title_key);
+    `);
     database.exec('ANALYZE');
     setMetadata.run('records', String(recordsInserted));
     setMetadata.run('built_at', new Date().toISOString());

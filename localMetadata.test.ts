@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as zlib from 'zlib';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from '@jest/globals';
 import { buildLocalMetadataIndex, parseAnnaMetadataLine, searchLocalMetadata } from './localMetadata';
 
@@ -62,5 +63,41 @@ describe('local Anna metadata index', () => {
     expect(matches.length).toBeGreaterThanOrEqual(2);
     expect(matches[0]).toMatchObject({ md5: '0123456789abcdef0123456789abcdef', confidence: 1 });
     expect(matches[1].title).toContain('Modern Library Edition');
+  });
+
+  it('resumes with a safe overlap and rebuilds deferred secondary indexes', async () => {
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'anna-metadata-resume-test-'));
+    temporaryFolders.push(folder);
+    const source = path.join(folder, 'aarecords__0.json.gz');
+    const database = path.join(folder, 'index.sqlite');
+    const lines = [
+      metadataLine('0123456789abcdef0123456789abcdef', 'First Complete Book', 'Author One'),
+      metadataLine('1123456789abcdef0123456789abcdef', 'Second Complete Book', 'Author Two'),
+      metadataLine('2123456789abcdef0123456789abcdef', 'Third Complete Book', 'Author Three'),
+      metadataLine('3123456789abcdef0123456789abcdef', 'Fourth Complete Book', 'Author Four'),
+    ];
+    fs.writeFileSync(source, zlib.gzipSync(`${lines.join('\n')}\n`));
+
+    const partial = await buildLocalMetadataIndex({ sourceFiles: [source], databasePath: database, maxRecords: 2 });
+    expect(partial.recordsInserted).toBe(2);
+    const resumed = await buildLocalMetadataIndex({ sourceFiles: [source], databasePath: database, skipRecords: 1 });
+    expect(resumed.recordsRead).toBe(4);
+    expect(resumed.recordsInserted).toBe(4);
+
+    const db = new DatabaseSync(database, { readOnly: true });
+    try {
+      const metadata = Object.fromEntries((db.prepare('SELECT key, value FROM index_metadata').all() as Array<{ key: string; value: string }>).map((row) => [row.key, row.value]));
+      const indexes = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Array<{ name: string }>).map((row) => row.name));
+      expect(metadata).toMatchObject({ records: '4', complete: 'true', search_backend: 'prefix_v1' });
+      expect(indexes.has('records_md5')).toBe(false);
+      expect(indexes.has('records_isbn13')).toBe(true);
+      expect(indexes.has('record_search_title_key')).toBe(true);
+    } finally {
+      db.close();
+    }
+    expect(searchLocalMetadata(database, 'Fourth Complete Book', 'Author Four', 5)[0]).toMatchObject({
+      md5: '3123456789abcdef0123456789abcdef',
+      confidence: 1,
+    });
   });
 });

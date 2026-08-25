@@ -27,8 +27,11 @@ async function indexCommand(): Promise<void> {
   const source = requiredOption('source');
   const database = requiredOption('database');
   const shard = option('shard');
+  const skipRecords = option('skip-records') ? Number(option('skip-records')) : undefined;
   const maxRecords = option('max-records') ? Number(option('max-records')) : undefined;
+  if (skipRecords !== undefined && (!Number.isInteger(skipRecords) || skipRecords < 0)) throw new Error('--skip-records must be a non-negative integer.');
   if (maxRecords !== undefined && (!Number.isInteger(maxRecords) || maxRecords <= 0)) throw new Error('--max-records must be a positive integer.');
+  if (skipRecords !== undefined && maxRecords !== undefined && skipRecords > maxRecords) throw new Error('--skip-records cannot exceed --max-records.');
   if (fs.existsSync(database) && !process.argv.includes('--append')) throw new Error(`Database already exists: ${database}. Use a new path or pass --append.`);
 
   const elasticsearchFolder = path.basename(source).toLowerCase() === 'elasticsearch' ? source : path.join(source, 'elasticsearch');
@@ -42,11 +45,13 @@ async function indexCommand(): Promise<void> {
   const result = await buildLocalMetadataIndex({
     sourceFiles,
     databasePath: database,
+    skipRecords,
     maxRecords,
     onProgress: (progress) => {
       const elapsedSeconds = Math.max(0.001, progress.elapsedMs / 1000);
       const rate = Math.round(progress.recordsRead / elapsedSeconds);
-      process.stdout.write(`\r${progress.recordsRead.toLocaleString()} read | ${progress.recordsInserted.toLocaleString()} indexed | ${rate.toLocaleString()} records/s`);
+      const shardNumber = Math.min(progress.filesTotal, progress.filesCompleted + 1);
+      process.stdout.write(`\rshard ${shardNumber}/${progress.filesTotal} | ${progress.recordsRead.toLocaleString()} read | ${progress.recordsInserted.toLocaleString()} indexed | ${rate.toLocaleString()} records/s`);
     },
   });
   process.stdout.write('\n');

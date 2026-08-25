@@ -83,6 +83,8 @@ For a bounded smoke test, add `--shard 0 --max-records 1000000`. You can benchma
 npm run metadata:cli -- benchmark --database "./metadata/anna-metadata.sqlite" --csv "./reading-list.csv"
 ```
 
+Interrupted builds can retain their committed rows. Restart with `--append --skip-records N`, where `N` is a previous `read` checkpoint from the build output. Using an earlier checkpoint is safe: the MD5 uniqueness constraint discards the overlap. Secondary search indexes are deferred until ingestion completes, so large builds avoid maintaining them row by row.
+
 ### Opt in to the untrusted catalog fallback
 
 If you cannot use a local metadata index, or want a fallback for rows with no usable local match, you can explicitly enable the search-only fallback:
