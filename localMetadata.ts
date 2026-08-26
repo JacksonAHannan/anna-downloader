@@ -354,15 +354,22 @@ export function searchLocalMetadata(databasePath: string, title: string, author 
         SELECT r.md5, r.title, r.author, r.publisher, r.language, r.extension, r.filesize,
                r.content_type, r.isbn13, r.has_aa_download, r.has_external_download,
                r.source_rank, 0 AS fts_rank
-        FROM record_search s
+        FROM record_search s INDEXED BY record_search_title_key
         JOIN records r ON r.id = s.record_id
         WHERE s.title_key >= ? AND s.title_key < ?
-        ORDER BY r.has_aa_download DESC, r.source_rank DESC
+        ORDER BY s.title_key ASC
         LIMIT ?
       `);
       for (let tokenCount = tokens.length; tokenCount >= 1 && rows.size < candidateLimit; tokenCount--) {
         const prefix = tokens.slice(0, tokenCount).join(' ');
-        for (const row of prefixQuery.all(prefix, `${prefix}\uffff`, candidateLimit) as unknown as DatabaseCandidateRow[]) rows.set(row.md5, row);
+        const prefixRows = prefixQuery.all(prefix, `${prefix}\uffff`, candidateLimit) as unknown as DatabaseCandidateRow[];
+        for (const row of prefixRows) rows.set(row.md5, row);
+        const hasStrongPrefixMatch = prefixRows.some((row) => {
+          const titleScore = textSimilarity(title, row.title);
+          const authorScore = author ? textSimilarity(author, row.author) : 1;
+          return titleScore >= 0.75 && (isPlaceholderAuthor(author) || !author || authorScore >= 0.3);
+        });
+        if (hasStrongPrefixMatch) break;
       }
     }
   } finally {

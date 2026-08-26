@@ -9,6 +9,7 @@ import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import { ANNAS_CATALOG_BASE_URLS, ANNAS_DOWNLOAD_BASE_URLS, UNTRUSTED_CATALOG_BASE_URLS, isTrustedAnnaURL } from './anna';
 import { searchLocalMetadata } from './localMetadata';
+import { searchLocalMetadataAsync } from './localMetadataAsync';
 
 // Constants
 
@@ -576,12 +577,14 @@ function displayLanguage(code: string): string {
   return normalized ? `${names[normalized] || code} [${code}]` : '';
 }
 
-/** Query the local Anna metadata index and return only records exposed through Anna's download service. */
-export function findBookInLocalMetadata(title: string, author: string, databasePath: string, limit = 50): Book[] {
+function assertLocalMetadataIndex(databasePath: string): void {
   if (!fs.existsSync(databasePath) || !fs.statSync(databasePath).isFile()) {
     throw new Error(`Local metadata index not found: ${databasePath}`);
   }
-  return searchLocalMetadata(databasePath, title, author, limit)
+}
+
+function localMetadataCandidatesToBooks(candidates: ReturnType<typeof searchLocalMetadata>): Book[] {
+  return candidates
     .filter((candidate) => candidate.hasAaDownload && candidate.extension)
     .map((candidate) => ({
       language: displayLanguage(candidate.language),
@@ -598,6 +601,17 @@ export function findBookInLocalMetadata(title: string, author: string, databaseP
     }));
 }
 
+/** Query the local Anna metadata index and return only records exposed through Anna's download service. */
+export function findBookInLocalMetadata(title: string, author: string, databasePath: string, limit = 50): Book[] {
+  assertLocalMetadataIndex(databasePath);
+  return localMetadataCandidatesToBooks(searchLocalMetadata(databasePath, title, author, limit));
+}
+
+async function findBookInLocalMetadataAsync(title: string, author: string, databasePath: string, limit = 50): Promise<Book[]> {
+  assertLocalMetadataIndex(databasePath);
+  return localMetadataCandidatesToBooks(await searchLocalMetadataAsync(databasePath, title, author, limit));
+}
+
 async function findBooksForRow(
   title: string,
   author: string,
@@ -609,7 +623,7 @@ async function findBooksForRow(
     // A configured local index is always queried first. Only a valid-but-
     // unhelpful local result set may proceed to an explicitly enabled fallback;
     // index access/corruption errors remain visible and never leak a title.
-    localBooks = findBookInLocalMetadata(title, author, config.metadataIndex);
+    localBooks = await findBookInLocalMetadataAsync(title, author, config.metadataIndex);
     if (isUsable(localBooks) || !config.untrustedCatalogSearch) return localBooks;
   }
   if (!config.untrustedCatalogSearch) {
@@ -1102,7 +1116,9 @@ export async function scanMatches(csvPath: string, config: Config, options: Scan
         options.onEvent?.({ rowIndex: i, status: 'failed', message });
       } else if (autoAccept) {
         applySelectedMatch(csvPath, i, candidates[0]);
-        options.onEvent?.({ rowIndex: i, status: 'matched', candidates, selected: candidates[0] });
+        // The selected edition is enough to update progress. Candidate lists
+        // are loaded on demand if the user later chooses "Change match".
+        options.onEvent?.({ rowIndex: i, status: 'matched', selected: candidates[0] });
       } else {
         updateCSVResult(csvPath, i, {
           status: 'pending_review',
