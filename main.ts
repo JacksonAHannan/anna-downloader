@@ -1024,6 +1024,49 @@ export interface ScanOptions {
   startIndex?: number;
 }
 
+export interface RescanReset {
+  rows: CSVRow[];
+  rowsReset: number;
+  downloadedPreserved: number;
+}
+
+/**
+ * Return a fresh scan queue while retaining confirmed files the user already
+ * owns. Rejections are reset because a new provider/index may yield new choices.
+ */
+export function resetRowsForRescan(rows: CSVRow[]): RescanReset {
+  let rowsReset = 0;
+  let downloadedPreserved = 0;
+  const resetFields: Partial<CSVRow> = {
+    status: 'Not started',
+    error: '',
+    matched_title: '',
+    matched_author: '',
+    match_confidence: '',
+    download_route: '',
+    average_speed: '',
+    selected_hash: '',
+    selected_url: '',
+    selected_title: '',
+    selected_authors: '',
+    selected_publisher: '',
+    selected_language: '',
+    selected_format: '',
+    selected_size: '',
+    selected_source: '',
+  };
+  const resetRows = rows.map((row) => {
+    const status = row.status?.trim().toLowerCase();
+    if (status === 'downloaded') {
+      downloadedPreserved += 1;
+      return { ...row };
+    }
+    rowsReset += 1;
+    return { ...row, ...resetFields };
+  });
+  return { rows: resetRows, rowsReset, downloadedPreserved };
+}
+
 /**
  * Search and rank every not-yet-decided CSV row, auto-accepting exact matches and
  * leaving everything else for manual review via applySelectedMatch/rejectRowMatch.

@@ -13,13 +13,13 @@ function isPreferredPublisher(publisher: string, preferredPublisher: string) {
   return preference.length > 0 && publisher.toLowerCase().includes(preference.toLowerCase());
 }
 
-const Icon = ({ name }: { name: 'file' | 'folder' | 'play' | 'stop' | 'check' | 'alert' | 'close' }) => {
+const Icon = ({ name }: { name: 'file' | 'folder' | 'play' | 'stop' | 'check' | 'alert' | 'close' | 'refresh' }) => {
   const paths = {
     file: <><path d="M6 2.5h7l5 5V21.5H6z"/><path d="M13 2.5v5h5"/></>,
     folder: <path d="M3.5 6.5h6l2 2h9v10.5h-17z"/>,
     play: <path d="m8 5 10 7-10 7z"/>, stop: <rect x="7" y="7" width="10" height="10" rx="1"/>,
     check: <path d="m7 12 3 3 7-7"/>, alert: <><path d="M12 4 3.5 20h17z"/><path d="M12 9v5M12 17.2v.1"/></>,
-    close: <path d="m7 7 10 10M17 7 7 17"/>,
+    close: <path d="m7 7 10 10M17 7 7 17"/>, refresh: <><path d="M19 8a7 7 0 1 0 1 5"/><path d="M19 3v5h-5"/></>,
   };
   return <svg aria-hidden="true" viewBox="0 0 24 24">{paths[name]}</svg>;
 };
@@ -149,6 +149,13 @@ export function App() {
           message: event.status === 'scanning' ? undefined : event.message ?? row.message,
         };
       }));
+    });
+    events.addEventListener('match-reset', (message) => {
+      const event = JSON.parse((message as MessageEvent).data) as { rows: ImportedRow[]; rowsReset: number; downloadedPreserved: number };
+      setRows(event.rows.map(importedRowToRow));
+      setExpandedMatches(new Set());
+      setReviewMode(false);
+      setReviewRowIndex(null);
     });
     events.addEventListener('scan-run', (message) => {
       const event = JSON.parse((message as MessageEvent).data) as { state: typeof scanState; message?: string; startedAt?: number };
@@ -311,16 +318,22 @@ export function App() {
     const data = await readApiResponse<{ error?: string }>(response);
     if (!response.ok) setError(data.error || 'Could not submit match decision.');
   }
-  async function startScan() {
+  async function startScan(rescanAll = false) {
     setError('');
     setScanState('scanning');
     try {
-      const resumeRow = scanState === 'stopped' && currentScanRow !== null ? currentScanRow + 2 : 1;
-      const response = await fetch('/api/match/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ startRow: resumeRow }) });
-      const data = await readApiResponse<{ error?: string }>(response);
+      const resumeRow = !rescanAll && scanState === 'stopped' && currentScanRow !== null ? currentScanRow + 2 : 1;
+      const response = await fetch('/api/match/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ startRow: resumeRow, rescanAll }) });
+      const data = await readApiResponse<{ error?: string; rows?: ImportedRow[]; rowsReset?: number; downloadedPreserved?: number }>(response);
       if (!response.ok) {
         setScanState('failed');
         setError(data.error || 'Could not start match scan.');
+      } else if (rescanAll) {
+        if (data.rows) setRows(data.rows.map(importedRowToRow));
+        setExpandedMatches(new Set());
+        setReviewMode(false);
+        setReviewRowIndex(null);
+        setToast(`Rescanning ${data.rowsReset ?? 0} rows · ${data.downloadedPreserved ?? 0} downloads preserved`);
       }
     } catch (reason) {
       setScanState('failed');
@@ -450,7 +463,7 @@ export function App() {
         <div className="match-toolbar-actions">
           <span className={`connection ${scanState}`}>{scanState === 'scanning' ? 'Scanning…' : scanState === 'completed' ? 'Scan complete' : scanState === 'paused' ? 'Daily limit reached' : scanState === 'stopped' ? 'Scan stopped' : ''}</span>
           {reviewIndexes.length > 0 && <button className="primary review-matches" onClick={() => openFocusedReview()}>{`Review ${reviewIndexes.length} partial ${reviewIndexes.length === 1 ? 'match' : 'matches'}`}</button>}
-          {scanState === 'scanning' ? <button className="secondary" onClick={stopScan} disabled={stoppingScan}><Icon name="stop" />{stoppingScan ? 'Stopping…' : 'Stop scan'}</button> : <button className="secondary" disabled={!rows.length || runState === 'running'} onClick={startScan}><Icon name="play" />{scanState === 'stopped' && currentScanRow !== null ? `Resume after row ${currentScanRow + 1}` : 'Scan matches'}</button>}
+          {scanState === 'scanning' ? <button className="secondary" onClick={stopScan} disabled={stoppingScan}><Icon name="stop" />{stoppingScan ? 'Stopping…' : 'Stop scan'}</button> : <><button className="secondary" disabled={!rows.length || runState === 'running'} onClick={() => startScan()}><Icon name="play" />{scanState === 'stopped' && currentScanRow !== null ? `Resume after row ${currentScanRow + 1}` : 'Scan matches'}</button><button className="secondary rescan-all" disabled={!rows.length || runState === 'running'} onClick={() => startScan(true)} title="Clear prior scan results and match every non-downloaded row again"><Icon name="refresh" />Rescan all</button></>}
         </div>
       </section>
       <section className="destination-panel" aria-label="Download destination">

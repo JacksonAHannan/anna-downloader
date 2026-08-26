@@ -28,6 +28,7 @@ import {
   findRowCandidates,
   applySelectedMatch,
   rejectRowMatch,
+  resetRowsForRescan,
   scanMatches,
   processCSV,
   MatchCandidate,
@@ -785,6 +786,25 @@ describe('scanMatches', () => {
     expect(row.status).toBe('pending_review');
     expect(row.selected_hash).toBeFalsy();
     expect(candidateCount).toBeGreaterThan(0);
+  });
+});
+
+describe('resetRowsForRescan', () => {
+  it('clears all scan-derived state while preserving downloads and custom columns', () => {
+    const result = resetRowsForRescan([
+      { author: 'A', title: 'Owned', status: 'downloaded', selected_hash: 'ownedhash', download_route: 'existing_library', notes: 'keep owned' },
+      { author: 'B', title: 'Rejected', status: 'rejected', error: 'manual choice', notes: 'keep rejected' },
+      { author: 'C', title: 'Matched', status: 'matched', selected_hash: 'stalehash', selected_title: 'Old edition', matched_title: 'Old edition', notes: 'keep custom' },
+      { author: 'D', title: 'Retry', status: 'failed', error: 'old failure', selected_hash: 'failedhash' },
+      { author: 'E', title: 'Unseen', status: 'Not started' },
+    ]);
+
+    expect(result).toMatchObject({ rowsReset: 4, downloadedPreserved: 1 });
+    expect(result.rows[0]).toMatchObject({ status: 'downloaded', selected_hash: 'ownedhash', download_route: 'existing_library', notes: 'keep owned' });
+    expect(result.rows[1]).toMatchObject({ status: 'Not started', error: '', selected_hash: '', notes: 'keep rejected' });
+    expect(result.rows[2]).toMatchObject({ status: 'Not started', selected_hash: '', selected_title: '', matched_title: '', notes: 'keep custom' });
+    expect(result.rows[3]).toMatchObject({ status: 'Not started', error: '', selected_hash: '' });
+    expect(result.rows[4]).toMatchObject({ status: 'Not started', error: '', selected_hash: '' });
   });
 });
 

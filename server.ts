@@ -5,7 +5,7 @@ import * as path from 'path';
 import type { Server } from 'http';
 import {
   Book, DownloadEvent, MatchCandidate, MatchEvent, RateLimitError, SearchAccessError,
-  applySelectedMatch, findRowCandidates, loadConfig, parseCSVContent, processCSV, readCSV, rejectRowMatch, scanMatches,
+  applySelectedMatch, findRowCandidates, loadConfig, parseCSVContent, processCSV, readCSV, rejectRowMatch, resetRowsForRescan, scanMatches,
 } from './main';
 import { generateBookList, listLLMProviders } from './llm';
 import { isTrustedAnnaURL } from './anna';
@@ -388,20 +388,47 @@ app.post('/api/match/scan', async (request, response) => {
   if (activeController) return response.status(409).json({ error: 'Stop the active download run before scanning.' });
   if (!fs.existsSync(csvPath)) return response.status(400).json({ error: 'Choose a CSV file first.' });
   const totalRows = readCSV(csvPath).length;
-  const startRow = Number(request.body?.startRow ?? 1);
+  const rescanAll = request.body?.rescanAll === true;
+  const startRow = rescanAll ? 1 : Number(request.body?.startRow ?? 1);
   if (!Number.isInteger(startRow) || startRow < 1 || startRow > totalRows + 1) {
     return response.status(400).json({ error: `Scan start row must be a whole number between 1 and ${totalRows + 1}.` });
+  }
+
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    config = loadConfig({ requireSecretKey: false });
+    config.preferredPublisher = selectedPreferredPublisher;
+  } catch (error) {
+    return response.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+
+  let reset: ReturnType<typeof resetRowsForRescan> | undefined;
+  if (rescanAll) {
+    try {
+      reset = resetRowsForRescan(readCSV(csvPath));
+      writeCSVRows(csvPath, reset.rows);
+      broadcast('match-reset', {
+        rows: reset.rows,
+        rowsReset: reset.rowsReset,
+        downloadedPreserved: reset.downloadedPreserved,
+      });
+    } catch (error) {
+      return response.status(500).json({ error: `Could not reset the scan queue: ${error instanceof Error ? error.message : String(error)}` });
+    }
   }
 
   activeScanController = new AbortController();
   const controller = activeScanController;
   scanState = 'scanning'; currentScanRow = startRow - 1; operationStartedAt = Date.now();
   broadcast('scan-run', { state: scanState, startedAt: operationStartedAt });
-  response.status(202).json({ started: true });
+  response.status(202).json({
+    started: true,
+    rows: reset?.rows,
+    rowsReset: reset?.rowsReset,
+    downloadedPreserved: reset?.downloadedPreserved,
+  });
 
   try {
-    const config = loadConfig({ requireSecretKey: false });
-    config.preferredPublisher = selectedPreferredPublisher;
     await scanMatches(csvPath, config, {
       signal: controller.signal,
       startIndex: startRow - 1,
